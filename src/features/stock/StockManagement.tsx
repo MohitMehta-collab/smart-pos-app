@@ -1,9 +1,9 @@
 import React, { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { StockService } from '../../services/stockService';
-import type { StockItem, ItemVariant } from '../../types';
+import type { StockItem, ItemVariant, PurchaseHistoryEntry } from '../../types';
 import { formatCurrency, formatQuantity, calculateWeightedAveragePrice } from '../../utils/pricing';
-import { useAppStore } from '../../store/useAppStore';
+import { useAppStore, scheduleCloudSync } from '../../store/useAppStore';
 import {
   Plus,
   Search,
@@ -45,7 +45,8 @@ export const StockManagement: React.FC = () => {
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
   const [editingItem, setEditingItem] = useState<StockItem | null>(null);
 
-  // Restock Form state
+  // Restock Form state (supports both non-variant batch restock and variant-level restock)
+  const [batchVariantsState, setBatchVariantsState] = useState<(ItemVariant & { addedQty?: number; newBatchCost?: number })[]>([]);
   const [batchQty, setBatchQty] = useState<number>(10);
   const [batchCostPrice, setBatchCostPrice] = useState<number>(0);
   const [newSellingPrice, setNewSellingPrice] = useState<number>(0);
@@ -119,6 +120,7 @@ export const StockManagement: React.FC = () => {
     try {
       await StockService.deleteItem(item.id);
       await loadStock();
+      scheduleCloudSync();
     } catch (err) {
       console.error('Failed to delete item', err);
       alert('Failed to delete item.');
@@ -179,6 +181,7 @@ export const StockManagement: React.FC = () => {
       await StockService.addCategory(trimmed);
       setNewCategoryName('');
       await loadCategories();
+      scheduleCloudSync();
     } catch (err: any) {
       alert(err?.message || 'Failed to add category');
     }
@@ -193,6 +196,7 @@ export const StockManagement: React.FC = () => {
       setEditingCategoryName('');
       await loadCategories();
       await loadStock();
+      scheduleCloudSync();
     } catch (err: any) {
       alert(err?.message || 'Failed to update category');
     }
@@ -206,10 +210,12 @@ export const StockManagement: React.FC = () => {
         id: `var-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
         color: '',
         size: '',
+        barcode: '',
         quantityLeft: 5,
         threshold: newItemThreshold || 2,
         purchasePrice: Number(newItemPurchasePrice) || 0,
         sellingPrice: Number(newItemSellPrice) || 0,
+        shelfLocation: newItemShelf || '',
       },
     ]);
   };
@@ -254,6 +260,15 @@ export const StockManagement: React.FC = () => {
     setNewSellingPrice(item.sellingPrice || 150);
     setBatchQty(10);
     setBatchSupplier('');
+    setBatchVariantsState(
+      item.variants
+        ? item.variants.map((v) => ({
+            ...v,
+            addedQty: 0,
+            newBatchCost: v.purchasePrice || item.averagePurchasePrice || 0,
+          }))
+        : []
+    );
   };
 
   const handleOpenEditItem = (item: StockItem) => {
@@ -279,16 +294,79 @@ export const StockManagement: React.FC = () => {
     if (!selectedItemForBatch) return;
 
     try {
-      await StockService.addRestockBatch(
-        selectedItemForBatch.id,
-        Number(batchQty),
-        Number(batchCostPrice),
-        batchSupplier,
-        Number(newSellingPrice)
-      );
+      if (selectedItemForBatch.hasVariants && batchVariantsState.length > 0) {
+        const now = new Date().toISOString();
+        const newHistoryEntries: PurchaseHistoryEntry[] = [];
+
+        const updatedVariants: ItemVariant[] = batchVariantsState.map((v) => {
+          const added = Number(v.addedQty) || 0;
+          const batchCost = Number(v.newBatchCost) || Number(v.purchasePrice) || 0;
+          const existingQty = Number(v.quantityLeft) || 0;
+          const existingCost = Number(v.purchasePrice) || 0;
+
+          const newAvgVariantCost =
+            added > 0
+              ? calculateWeightedAveragePrice(existingQty, existingCost, added, batchCost)
+              : existingCost;
+
+          const nextQty = existingQty + added;
+
+          if (added > 0) {
+            newHistoryEntries.push({
+              id: `ph-var-${v.id}-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+              date: now,
+              quantity: added,
+              purchasePrice: batchCost,
+              supplier: batchSupplier.trim()
+                ? `${batchSupplier.trim()} (${v.color || ''} ${v.size || ''})`.trim()
+                : `Variant Restock (${v.color || ''} ${v.size || ''})`.trim(),
+            });
+          }
+
+          const { addedQty, newBatchCost, ...cleanVariant } = v;
+          return {
+            ...cleanVariant,
+            quantityLeft: nextQty,
+            purchasePrice: newAvgVariantCost,
+            sellingPrice: Number(v.sellingPrice) || 0,
+            threshold: Number(v.threshold) || 0,
+            shelfLocation: v.shelfLocation?.trim() || selectedItemForBatch.shelfLocation,
+          };
+        });
+
+        const totalStock = updatedVariants.reduce((sum, v) => sum + v.quantityLeft, 0);
+        const totalValue = updatedVariants.reduce(
+          (sum, v) => sum + v.quantityLeft * (v.purchasePrice || 0),
+          0
+        );
+        const overallAvgCost =
+          totalStock > 0
+            ? Number((totalValue / totalStock).toFixed(2))
+            : selectedItemForBatch.averagePurchasePrice;
+
+        await StockService.updateItem(selectedItemForBatch.id, {
+          variants: updatedVariants,
+          quantityLeft: totalStock,
+          averagePurchasePrice: overallAvgCost,
+          purchaseHistory: [
+            ...(selectedItemForBatch.purchaseHistory || []),
+            ...newHistoryEntries,
+          ],
+          updatedAt: now,
+        });
+      } else {
+        await StockService.addRestockBatch(
+          selectedItemForBatch.id,
+          Number(batchQty),
+          Number(batchCostPrice),
+          batchSupplier,
+          Number(newSellingPrice)
+        );
+      }
 
       setSelectedItemForBatch(null);
       await loadStock();
+      scheduleCloudSync();
     } catch (err: any) {
       console.error('Failed to save restock batch', err);
       alert(err?.message || 'Failed to save restock batch.');
@@ -306,7 +384,7 @@ export const StockManagement: React.FC = () => {
       return;
     }
     if (hasVariants && variantsList.length === 0) {
-      alert('Please add at least one variant or uncheck "Has Variants".');
+      alert('Please add at least one variant or uncheck "Enable Variants".');
       return;
     }
 
@@ -317,12 +395,15 @@ export const StockManagement: React.FC = () => {
     const cleanedVariants: ItemVariant[] | undefined = hasVariants
       ? variantsList.map((v) => ({
           ...v,
+          id: v.id || `var-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
           color: (v.color || '').trim(),
           size: (v.size || '').trim(),
+          barcode: (v.barcode || '').trim(),
           quantityLeft: Number(v.quantityLeft) || 0,
-          threshold: Number(v.threshold) || 0,
+          threshold: Number(v.threshold) || Number(newItemThreshold) || 0,
           purchasePrice: Number(v.purchasePrice) || Number(newItemPurchasePrice) || 0,
           sellingPrice: Number(v.sellingPrice) || Number(newItemSellPrice) || 0,
+          shelfLocation: (v.shelfLocation || newItemShelf).trim().toUpperCase(),
         }))
       : undefined;
 
@@ -330,6 +411,16 @@ export const StockManagement: React.FC = () => {
       hasVariants && cleanedVariants
         ? cleanedVariants.reduce((sum, v) => sum + v.quantityLeft, 0)
         : Number(newItemInitialQty);
+
+    const computedAvgCost =
+      hasVariants && cleanedVariants && computedTotalQty > 0
+        ? Number(
+            (
+              cleanedVariants.reduce((sum, v) => sum + v.quantityLeft * v.purchasePrice, 0) /
+              computedTotalQty
+            ).toFixed(2)
+          )
+        : Number(newItemPurchasePrice);
 
     try {
       if (isEdit) {
@@ -345,7 +436,7 @@ export const StockManagement: React.FC = () => {
           quantityLeft: computedTotalQty,
           threshold: Number(newItemThreshold),
           sellingPrice: Number(newItemSellPrice),
-          averagePurchasePrice: Number(newItemPurchasePrice),
+          averagePurchasePrice: computedAvgCost,
           updatedAt: now,
         };
         await StockService.updateItem(itemId, updateData);
@@ -363,13 +454,13 @@ export const StockManagement: React.FC = () => {
           quantityLeft: computedTotalQty,
           threshold: Number(newItemThreshold),
           sellingPrice: Number(newItemSellPrice),
-          averagePurchasePrice: Number(newItemPurchasePrice),
+          averagePurchasePrice: computedAvgCost,
           purchaseHistory: [
             {
               id: `ph-init-${Date.now()}`,
               date: now,
               quantity: computedTotalQty,
-              purchasePrice: Number(newItemPurchasePrice),
+              purchasePrice: computedAvgCost,
               supplier: 'Initial Inventory Stock',
             },
           ],
@@ -381,6 +472,7 @@ export const StockManagement: React.FC = () => {
 
       closeItemModal();
       await loadStock();
+      scheduleCloudSync();
     } catch (err: any) {
       console.error('Failed to save item', err);
       alert(err?.message || 'Failed to save item.');
@@ -388,9 +480,41 @@ export const StockManagement: React.FC = () => {
   };
 
   const filteredItems = items.filter((item) => {
-    if (filterLowStockOnly && item.quantityLeft > item.threshold) return false;
+    const query = searchQuery.trim().toLowerCase();
+
+    if (filterLowStockOnly) {
+      const hasLowStockVariant =
+        item.hasVariants && item.variants
+          ? item.variants.some((v) => v.quantityLeft <= v.threshold)
+          : false;
+      if (item.quantityLeft > item.threshold && !hasLowStockVariant) return false;
+    }
+
     if (categoryFilter !== 'all' && (item.category || '') !== categoryFilter) return false;
-    return true;
+
+    if (!query) return true;
+
+    const matchesMain =
+      item.name.toLowerCase().includes(query) ||
+      (item.hindiName && item.hindiName.toLowerCase().includes(query)) ||
+      item.id.toLowerCase().includes(query) ||
+      item.shelfLocation.toLowerCase().includes(query) ||
+      (item.category && item.category.toLowerCase().includes(query)) ||
+      (item.serialNumber && item.serialNumber.toLowerCase().includes(query));
+
+    const matchesVariant =
+      item.hasVariants && item.variants
+        ? item.variants.some(
+            (v) =>
+              v.id.toLowerCase().includes(query) ||
+              (v.color && v.color.toLowerCase().includes(query)) ||
+              (v.size && v.size.toLowerCase().includes(query)) ||
+              (v.shelfLocation && v.shelfLocation.toLowerCase().includes(query)) ||
+              (v.barcode && v.barcode.toLowerCase().includes(query))
+          )
+        : false;
+
+    return matchesMain || matchesVariant;
   });
 
   const renderItemRow = (item: StockItem, showCategoryColumn: boolean) => {
@@ -445,6 +569,7 @@ export const StockManagement: React.FC = () => {
                         ? 'bg-amber-100 text-amber-800 border-amber-300 font-bold'
                         : 'bg-slate-50 text-slate-600 border-slate-200'
                     }`}
+                    title={`ID: ${v.id} | Serial: ${v.barcode || 'N/A'} | Shelf: ${v.shelfLocation || item.shelfLocation} | Cost: ₹${v.purchasePrice} | Price: ₹${v.sellingPrice}`}
                   >
                     {v.color || ''} {v.size || ''} ({v.quantityLeft})
                   </span>
@@ -764,7 +889,7 @@ export const StockManagement: React.FC = () => {
       {/* Info CTA Modal: Detailed Purchase Batches and Weighted Average History */}
       {selectedItemForHistory && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-xs p-4">
-          <div className="bg-white rounded-2xl max-w-lg w-full p-6 shadow-2xl border border-slate-100 space-y-4">
+          <div className="bg-white rounded-2xl max-w-lg w-full p-6 shadow-2xl border border-slate-100 space-y-4 max-h-[90vh] overflow-y-auto">
             <div className="flex items-center justify-between border-b pb-3 border-slate-100">
               <div>
                 <h3 className="font-bold text-lg text-slate-900 flex items-center gap-2">
@@ -797,6 +922,37 @@ export const StockManagement: React.FC = () => {
                 </div>
               </div>
             </div>
+
+            {/* Variant-level Average Cost Breakdown */}
+            {selectedItemForHistory.hasVariants &&
+              selectedItemForHistory.variants &&
+              selectedItemForHistory.variants.length > 0 && (
+                <div>
+                  <h4 className="text-xs font-bold uppercase tracking-wider text-slate-500 mb-2">
+                    Variant Cost & Stock Breakdown
+                  </h4>
+                  <div className="divide-y divide-slate-100 border border-slate-200 rounded-xl overflow-hidden">
+                    {selectedItemForHistory.variants.map((v) => (
+                      <div key={v.id} className="p-2.5 text-xs flex items-center justify-between bg-slate-50/60">
+                        <div>
+                          <span className="font-bold text-slate-800">
+                            {v.color || ''} {v.size || ''}
+                          </span>
+                          <span className="ml-2 text-[10px] font-mono text-slate-500">
+                            ({v.id} • {v.barcode || 'No Serial'})
+                          </span>
+                        </div>
+                        <div className="text-right">
+                          <span className="font-semibold text-indigo-700">
+                            Avg Cost: {formatCurrency(v.purchasePrice, currency)}
+                          </span>
+                          <span className="text-slate-400 ml-2">({v.quantityLeft} in stock)</span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
 
             <div>
               <h4 className="text-xs font-bold uppercase tracking-wider text-slate-500 mb-2">
@@ -840,12 +996,12 @@ export const StockManagement: React.FC = () => {
         </div>
       )}
 
-      {/* Restock Batch Modal */}
+      {/* Restock Batch / Variant Restock Modal */}
       {selectedItemForBatch && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-xs p-4">
           <form
             onSubmit={handleSaveRestockBatch}
-            className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-100 space-y-4"
+            className="bg-white rounded-2xl max-w-2xl w-full p-6 shadow-2xl border border-slate-100 space-y-4 max-h-[90vh] overflow-y-auto"
           >
             <div className="flex items-center justify-between border-b pb-3 border-slate-100">
               <div>
@@ -863,107 +1019,283 @@ export const StockManagement: React.FC = () => {
               </button>
             </div>
 
-            <div className="grid grid-cols-2 gap-3 text-xs bg-slate-50 p-3 rounded-xl border border-slate-200">
-              <div>
-                <span className="text-slate-500">{t('stock.existingStock')}:</span>
-                <span className="font-bold ml-1 text-slate-800">
-                  {selectedItemForBatch.quantityLeft}
-                </span>
-              </div>
-              <div>
-                <span className="text-slate-500">Current Avg Cost:</span>
-                <span className="font-bold ml-1 text-slate-800">
-                  {costUnlocked ? formatCurrency(selectedItemForBatch.averagePurchasePrice, currency) : '••••••'}
-                </span>
-              </div>
-            </div>
-
-            <div className="space-y-3">
-              <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1">
-                  {t('stock.addedQty')}{' '}
-                  {selectedItemForBatch.unitType === 'weight'
-                    ? '(kg)'
-                    : selectedItemForBatch.unitType === 'both'
-                    ? '(qty/kg)'
-                    : '(pcs)'}{' '}
-                  *
-                </label>
-                <input
-                  type="number"
-                  required
-                  min={selectedItemForBatch.unitType === 'count' ? 1 : 0.01}
-                  step={selectedItemForBatch.unitType === 'count' ? 1 : 'any'}
-                  value={batchQty}
-                  onChange={(e) => setBatchQty(parseFloat(e.target.value) || 0)}
-                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500"
-                />
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1">
-                  {t('stock.newBatchPrice')} *
-                </label>
-                <input
-                  type="number"
-                  required
-                  min="0"
-                  step="any"
-                  value={batchCostPrice}
-                  onChange={(e) => setBatchCostPrice(parseFloat(e.target.value) || 0)}
-                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500"
-                />
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1">
-                  {t('stock.newSellingPrice')}
-                </label>
-                <input
-                  type="number"
-                  min="0"
-                  step="any"
-                  value={newSellingPrice}
-                  onChange={(e) => setNewSellingPrice(parseFloat(e.target.value) || 0)}
-                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500"
-                />
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1">
-                  Supplier Name
-                </label>
-                <input
-                  type="text"
-                  placeholder="e.g. Surat Wholesale Corp"
-                  value={batchSupplier}
-                  onChange={(e) => setBatchSupplier(e.target.value)}
-                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500"
-                />
-              </div>
-
-              <div className="p-3 bg-emerald-50 rounded-xl border border-emerald-200">
-                <div className="text-[11px] text-emerald-800 font-medium">
-                  {t('stock.calcAvgPreview')}:
+            {selectedItemForBatch.hasVariants && batchVariantsState.length > 0 ? (
+              <div className="space-y-3">
+                <div className="border-b border-slate-200 pb-2 flex items-center justify-between">
+                  <h4 className="text-xs font-bold text-slate-800 uppercase tracking-wide">
+                    Product Variants Restock
+                  </h4>
+                  <span className="text-[11px] text-slate-500">Serial numbers remain fixed</span>
                 </div>
-                <div className="text-base font-extrabold text-emerald-900 mt-0.5">
-                  {costUnlocked
-                    ? formatCurrency(
-                        calculateWeightedAveragePrice(
-                          selectedItemForBatch.quantityLeft,
-                          selectedItemForBatch.averagePurchasePrice,
-                          Number(batchQty),
-                          Number(batchCostPrice)
-                        ),
-                        currency
-                      )
-                    : '••••••'}
-                  <span className="text-xs font-normal text-emerald-700 ml-1.5">
-                    (Total: {selectedItemForBatch.quantityLeft + Number(batchQty)} units)
-                  </span>
+
+                {batchVariantsState.map((v, idx) => {
+                  const added = Number(v.addedQty) || 0;
+                  const batchCost = Number(v.newBatchCost) || Number(v.purchasePrice) || 0;
+                  const previewAvg =
+                    added > 0
+                      ? calculateWeightedAveragePrice(
+                          Number(v.quantityLeft) || 0,
+                          Number(v.purchasePrice) || 0,
+                          added,
+                          batchCost
+                        )
+                      : Number(v.purchasePrice) || 0;
+
+                  return (
+                    <div
+                      key={v.id}
+                      className="p-3.5 bg-slate-50 border border-slate-200 rounded-xl space-y-2.5"
+                    >
+                      <div className="flex justify-between items-center border-b border-slate-200 pb-1.5">
+                        <div className="flex items-center gap-2">
+                          <span className="font-bold text-slate-800 text-xs">
+                            {v.color || ''} {v.size || ''}
+                          </span>
+                          <span className="text-[10px] text-slate-500">
+                            Existing: <strong>{v.quantityLeft}</strong>
+                          </span>
+                        </div>
+                        <span className="text-[10px] font-mono bg-indigo-100 text-indigo-800 px-2 py-0.5 rounded">
+                          Serial: {v.barcode || 'N/A'} (Fixed)
+                        </span>
+                      </div>
+
+                      <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+                        <div>
+                          <label className="block text-[10px] font-bold text-slate-600 mb-1">
+                            + Added Qty
+                          </label>
+                          <input
+                            type="number"
+                            min="0"
+                            step={selectedItemForBatch.unitType === 'count' ? 1 : 'any'}
+                            value={v.addedQty ?? 0}
+                            onChange={(e) => {
+                              const updated = [...batchVariantsState];
+                              updated[idx] = {
+                                ...updated[idx],
+                                addedQty: parseFloat(e.target.value) || 0,
+                              };
+                              setBatchVariantsState(updated);
+                            }}
+                            className="w-full px-2.5 py-1.5 text-xs border border-slate-300 rounded-lg font-semibold"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-[10px] font-bold text-slate-600 mb-1">
+                            Batch Cost (₹)
+                          </label>
+                          <input
+                            type="number"
+                            min="0"
+                            step="any"
+                            value={v.newBatchCost ?? v.purchasePrice}
+                            onChange={(e) => {
+                              const updated = [...batchVariantsState];
+                              updated[idx] = {
+                                ...updated[idx],
+                                newBatchCost: parseFloat(e.target.value) || 0,
+                              };
+                              setBatchVariantsState(updated);
+                            }}
+                            className="w-full px-2.5 py-1.5 text-xs border border-slate-300 rounded-lg font-semibold"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-[10px] font-bold text-slate-600 mb-1">
+                            Selling Price (₹)
+                          </label>
+                          <input
+                            type="number"
+                            min="0"
+                            step="any"
+                            value={v.sellingPrice}
+                            onChange={(e) => {
+                              const updated = [...batchVariantsState];
+                              updated[idx] = {
+                                ...updated[idx],
+                                sellingPrice: parseFloat(e.target.value) || 0,
+                              };
+                              setBatchVariantsState(updated);
+                            }}
+                            className="w-full px-2.5 py-1.5 text-xs border border-slate-300 rounded-lg font-bold text-indigo-700"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-[10px] font-bold text-slate-600 mb-1">
+                            Low Alert
+                          </label>
+                          <input
+                            type="number"
+                            min="0"
+                            value={v.threshold}
+                            onChange={(e) => {
+                              const updated = [...batchVariantsState];
+                              updated[idx] = {
+                                ...updated[idx],
+                                threshold: parseFloat(e.target.value) || 0,
+                              };
+                              setBatchVariantsState(updated);
+                            }}
+                            className="w-full px-2.5 py-1.5 text-xs border border-slate-300 rounded-lg font-semibold"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-[10px] font-bold text-slate-600 mb-1">
+                            Shelf No.
+                          </label>
+                          <input
+                            type="text"
+                            value={v.shelfLocation || ''}
+                            onChange={(e) => {
+                              const updated = [...batchVariantsState];
+                              updated[idx] = {
+                                ...updated[idx],
+                                shelfLocation: e.target.value.toUpperCase(),
+                              };
+                              setBatchVariantsState(updated);
+                            }}
+                            className="w-full px-2.5 py-1.5 text-xs border border-slate-300 rounded-lg font-semibold uppercase"
+                            placeholder="e.g. A-2"
+                          />
+                        </div>
+                      </div>
+
+                      <div className="flex items-center justify-between text-[11px] bg-emerald-50 text-emerald-800 px-2.5 py-1.5 rounded-lg border border-emerald-200">
+                        <span>
+                          New Total Qty: <strong>{(Number(v.quantityLeft) || 0) + added}</strong>
+                        </span>
+                        <span>
+                          New Weighted Avg Cost:{' '}
+                          <strong>
+                            {costUnlocked ? formatCurrency(previewAvg, currency) : '••••••'}
+                          </strong>
+                        </span>
+                      </div>
+                    </div>
+                  );
+                })}
+
+                <div>
+                  <label className="block text-xs font-semibold text-slate-700 mb-1">
+                    Supplier Name
+                  </label>
+                  <input
+                    type="text"
+                    placeholder="e.g. Surat Wholesale Corp"
+                    value={batchSupplier}
+                    onChange={(e) => setBatchSupplier(e.target.value)}
+                    className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500"
+                  />
                 </div>
               </div>
-            </div>
+            ) : (
+              <>
+                <div className="grid grid-cols-2 gap-3 text-xs bg-slate-50 p-3 rounded-xl border border-slate-200">
+                  <div>
+                    <span className="text-slate-500">{t('stock.existingStock')}:</span>
+                    <span className="font-bold ml-1 text-slate-800">
+                      {selectedItemForBatch.quantityLeft}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-slate-500">Current Avg Cost:</span>
+                    <span className="font-bold ml-1 text-slate-800">
+                      {costUnlocked
+                        ? formatCurrency(selectedItemForBatch.averagePurchasePrice, currency)
+                        : '••••••'}
+                    </span>
+                  </div>
+                </div>
+
+                <div className="space-y-3">
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-700 mb-1">
+                      {t('stock.addedQty')}{' '}
+                      {selectedItemForBatch.unitType === 'weight'
+                        ? '(kg)'
+                        : selectedItemForBatch.unitType === 'both'
+                        ? '(qty/kg)'
+                        : '(pcs)'}{' '}
+                      *
+                    </label>
+                    <input
+                      type="number"
+                      required
+                      min={selectedItemForBatch.unitType === 'count' ? 1 : 0.01}
+                      step={selectedItemForBatch.unitType === 'count' ? 1 : 'any'}
+                      value={batchQty}
+                      onChange={(e) => setBatchQty(parseFloat(e.target.value) || 0)}
+                      className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-700 mb-1">
+                      {t('stock.newBatchPrice')} *
+                    </label>
+                    <input
+                      type="number"
+                      required
+                      min="0"
+                      step="any"
+                      value={batchCostPrice}
+                      onChange={(e) => setBatchCostPrice(parseFloat(e.target.value) || 0)}
+                      className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-700 mb-1">
+                      {t('stock.newSellingPrice')}
+                    </label>
+                    <input
+                      type="number"
+                      min="0"
+                      step="any"
+                      value={newSellingPrice}
+                      onChange={(e) => setNewSellingPrice(parseFloat(e.target.value) || 0)}
+                      className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-700 mb-1">
+                      Supplier Name
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="e.g. Surat Wholesale Corp"
+                      value={batchSupplier}
+                      onChange={(e) => setBatchSupplier(e.target.value)}
+                      className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500"
+                    />
+                  </div>
+
+                  <div className="p-3 bg-emerald-50 rounded-xl border border-emerald-200">
+                    <div className="text-[11px] text-emerald-800 font-medium">
+                      {t('stock.calcAvgPreview')}:
+                    </div>
+                    <div className="text-base font-extrabold text-emerald-900 mt-0.5">
+                      {costUnlocked
+                        ? formatCurrency(
+                            calculateWeightedAveragePrice(
+                              selectedItemForBatch.quantityLeft,
+                              selectedItemForBatch.averagePurchasePrice,
+                              Number(batchQty),
+                              Number(batchCostPrice)
+                            ),
+                            currency
+                          )
+                        : '••••••'}
+                      <span className="text-xs font-normal text-emerald-700 ml-1.5">
+                        (Total: {selectedItemForBatch.quantityLeft + Number(batchQty)} units)
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              </>
+            )}
 
             <div className="flex gap-2 pt-2">
               <button
@@ -1045,7 +1377,7 @@ export const StockManagement: React.FC = () => {
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-xs p-4">
           <form
             onSubmit={handleSaveItem}
-            className="bg-white rounded-2xl max-w-xl w-full p-6 shadow-2xl border border-slate-100 space-y-4 max-h-[90vh] overflow-y-auto"
+            className="bg-white rounded-2xl max-w-2xl w-full p-6 shadow-2xl border border-slate-100 space-y-4 max-h-[90vh] overflow-y-auto"
           >
             <div className="flex items-center justify-between border-b pb-3 border-slate-100">
               <h3 className="font-bold text-lg text-slate-900 flex items-center gap-2">
@@ -1180,7 +1512,10 @@ export const StockManagement: React.FC = () => {
 
             {/* Variants Toggle & Builder */}
             <div className="bg-slate-50 p-3.5 rounded-xl border border-slate-200 space-y-3">
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between border-b border-slate-200 pb-2">
+                <h4 className="text-xs font-bold text-slate-800 uppercase tracking-wide">
+                  Product Variants (Color / Finish / Size)
+                </h4>
                 <label className="flex items-center gap-2 text-xs font-bold text-slate-700 cursor-pointer">
                   <input
                     type="checkbox"
@@ -1194,66 +1529,181 @@ export const StockManagement: React.FC = () => {
                     }}
                     className="w-4 h-4 text-indigo-600 rounded border-slate-300"
                   />
-                  This item has multiple variants (Color / Finish / Size)
+                  Enable Variants
                 </label>
-                {hasVariants && (
-                  <button
-                    type="button"
-                    onClick={handleAddVariantRow}
-                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-indigo-600 text-white text-[11px] font-semibold hover:bg-indigo-700"
-                  >
-                    <Plus className="w-3 h-3" /> Add Variant
-                  </button>
-                )}
               </div>
 
               {hasVariants && (
-                <div className="space-y-2">
+                <div className="space-y-3">
+                  <div className="flex justify-between items-center">
+                    <span className="text-[11px] text-slate-500 font-medium">
+                      Configure attributes, serial numbers, and prices per variant:
+                    </span>
+                    <button
+                      type="button"
+                      onClick={handleAddVariantRow}
+                      className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-indigo-600 text-white text-[11px] font-semibold hover:bg-indigo-700"
+                    >
+                      <Plus className="w-3 h-3" /> Add Variant
+                    </button>
+                  </div>
+
                   {variantsList.map((v) => (
-                    <div key={v.id} className="grid grid-cols-12 gap-1.5 items-center bg-white p-2 rounded-lg border border-slate-200">
-                      <input
-                        type="text"
-                        placeholder="Color / Finish"
-                        value={v.color || ''}
-                        onChange={(e) => handleUpdateVariantRow(v.id, 'color', e.target.value)}
-                        className="col-span-3 px-2 py-1 text-xs border border-slate-300 rounded"
-                      />
-                      <input
-                        type="text"
-                        placeholder="Size (e.g. 8x4)"
-                        value={v.size || ''}
-                        onChange={(e) => handleUpdateVariantRow(v.id, 'size', e.target.value)}
-                        className="col-span-3 px-2 py-1 text-xs border border-slate-300 rounded"
-                      />
-                      <input
-                        type="number"
-                        min="0"
-                        placeholder="Qty"
-                        value={v.quantityLeft}
-                        onChange={(e) => handleUpdateVariantRow(v.id, 'quantityLeft', parseFloat(e.target.value) || 0)}
-                        className="col-span-2 px-2 py-1 text-xs border border-slate-300 rounded"
-                      />
-                      <input
-                        type="number"
-                        min="0"
-                        step="any"
-                        placeholder="Price ₹"
-                        value={v.sellingPrice ?? ''}
-                        onChange={(e) => handleUpdateVariantRow(v.id, 'sellingPrice', parseFloat(e.target.value) || 0)}
-                        className="col-span-3 px-2 py-1 text-xs border border-slate-300 rounded"
-                      />
-                      <button
-                        type="button"
-                        onClick={() => handleRemoveVariantRow(v.id)}
-                        className="col-span-1 p-1 text-rose-500 hover:bg-rose-50 rounded flex justify-center"
-                        title="Remove variant"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                      </button>
+                    <div
+                      key={v.id}
+                      className="bg-white p-3 rounded-xl border border-slate-200 space-y-2.5"
+                    >
+                      <div className="flex justify-between items-center text-[11px] text-slate-500">
+                        <span className="font-mono bg-indigo-50 text-indigo-700 px-2 py-0.5 rounded font-bold">
+                          Variant ID: {v.id}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => handleRemoveVariantRow(v.id)}
+                          className="text-rose-600 hover:text-rose-700 font-semibold flex items-center gap-1"
+                        >
+                          <Trash2 className="w-3 h-3" /> Remove
+                        </button>
+                      </div>
+
+                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                        <div>
+                          <label className="block text-[10px] font-bold text-slate-600 mb-0.5">
+                            Color / Finish
+                          </label>
+                          <input
+                            type="text"
+                            placeholder="e.g. Teak"
+                            value={v.color || ''}
+                            onChange={(e) => handleUpdateVariantRow(v.id, 'color', e.target.value)}
+                            className="w-full px-2 py-1 text-xs border border-slate-300 rounded"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-[10px] font-bold text-slate-600 mb-0.5">
+                            Size / Spec
+                          </label>
+                          <input
+                            type="text"
+                            placeholder="e.g. 8x4"
+                            value={v.size || ''}
+                            onChange={(e) => handleUpdateVariantRow(v.id, 'size', e.target.value)}
+                            className="w-full px-2 py-1 text-xs border border-slate-300 rounded"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-[10px] font-bold text-slate-600 mb-0.5">
+                            Variant Serial No *
+                          </label>
+                          <input
+                            type="text"
+                            placeholder="e.g. SN-VAR-01"
+                            value={v.barcode || ''}
+                            onChange={(e) => handleUpdateVariantRow(v.id, 'barcode', e.target.value)}
+                            className="w-full px-2 py-1 text-xs border border-slate-300 rounded font-mono"
+                            required
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-[10px] font-bold text-slate-600 mb-0.5">
+                            Initial Qty
+                          </label>
+                          <input
+                            type="number"
+                            min="0"
+                            value={v.quantityLeft}
+                            onChange={(e) =>
+                              handleUpdateVariantRow(
+                                v.id,
+                                'quantityLeft',
+                                parseFloat(e.target.value) || 0
+                              )
+                            }
+                            className="w-full px-2 py-1 text-xs border border-slate-300 rounded"
+                            required
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-[10px] font-bold text-slate-600 mb-0.5">
+                            Cost Price (₹)
+                          </label>
+                          <input
+                            type="number"
+                            min="0"
+                            step="any"
+                            value={v.purchasePrice}
+                            onChange={(e) =>
+                              handleUpdateVariantRow(
+                                v.id,
+                                'purchasePrice',
+                                parseFloat(e.target.value) || 0
+                              )
+                            }
+                            className="w-full px-2 py-1 text-xs border border-slate-300 rounded"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-[10px] font-bold text-slate-600 mb-0.5">
+                            Selling Price (₹) *
+                          </label>
+                          <input
+                            type="number"
+                            min="0"
+                            step="any"
+                            value={v.sellingPrice}
+                            onChange={(e) =>
+                              handleUpdateVariantRow(
+                                v.id,
+                                'sellingPrice',
+                                parseFloat(e.target.value) || 0
+                              )
+                            }
+                            className="w-full px-2 py-1 text-xs border border-slate-300 rounded font-bold text-indigo-700"
+                            required
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-[10px] font-bold text-slate-600 mb-0.5">
+                            Low Alert
+                          </label>
+                          <input
+                            type="number"
+                            min="0"
+                            value={v.threshold}
+                            onChange={(e) =>
+                              handleUpdateVariantRow(
+                                v.id,
+                                'threshold',
+                                parseFloat(e.target.value) || 0
+                              )
+                            }
+                            className="w-full px-2 py-1 text-xs border border-slate-300 rounded"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-[10px] font-bold text-slate-600 mb-0.5">
+                            Shelf No.
+                          </label>
+                          <input
+                            type="text"
+                            placeholder="e.g. A-1"
+                            value={v.shelfLocation || ''}
+                            onChange={(e) =>
+                              handleUpdateVariantRow(
+                                v.id,
+                                'shelfLocation',
+                                e.target.value.toUpperCase()
+                              )
+                            }
+                            className="w-full px-2 py-1 text-xs border border-slate-300 rounded uppercase"
+                          />
+                        </div>
+                      </div>
                     </div>
                   ))}
                   <p className="text-[11px] text-slate-500">
-                    Total stock will automatically sum across all variants ({variantsList.reduce((s, v) => s + (Number(v.quantityLeft) || 0), 0)} units).
+                    Total stock will automatically sum across all variants (
+                    {variantsList.reduce((s, v) => s + (Number(v.quantityLeft) || 0), 0)} units).
                   </p>
                 </div>
               )}

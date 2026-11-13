@@ -74,6 +74,8 @@ interface AuthState {
   setIsOnline: (online: boolean) => void;
   updateLastSyncTime: (time: string) => void;
   syncWithCloud: () => Promise<{ ok: boolean; message: string }>;
+  scheduleCloudSync: (delayMs?: number) => void;
+  flushCloudSync: () => void;
 
   // Custom Role Management (Admin)
   createRoleDefinition: (name: string, description: string, permissions: PermissionKey[]) => Promise<RoleDefinition | null>;
@@ -97,6 +99,33 @@ const maskEmailAddress = (email: string): string => {
   if (!local || !domain) return '***@***';
   const visible = local.slice(0, Math.min(2, local.length));
   return `${visible}***@${domain}`;
+};
+
+let cloudSyncDebounceTimer: number | null = null;
+const DEFAULT_SYNC_DEBOUNCE_MS = 12000; // 12 seconds (within 10-15s threshold)
+
+export const scheduleCloudSync = (delayMs: number = DEFAULT_SYNC_DEBOUNCE_MS): void => {
+  if (typeof window === 'undefined') return;
+  if (cloudSyncDebounceTimer !== null) {
+    window.clearTimeout(cloudSyncDebounceTimer);
+  }
+  cloudSyncDebounceTimer = window.setTimeout(() => {
+    cloudSyncDebounceTimer = null;
+    if (navigator.onLine) {
+      void useAppStore.getState().syncWithCloud();
+    }
+  }, delayMs);
+};
+
+export const flushCloudSync = (): void => {
+  if (typeof window === 'undefined') return;
+  if (cloudSyncDebounceTimer !== null) {
+    window.clearTimeout(cloudSyncDebounceTimer);
+    cloudSyncDebounceTimer = null;
+    if (navigator.onLine) {
+      void useAppStore.getState().syncWithCloud();
+    }
+  }
 };
 
 export const useAppStore = create<AuthState>((set, get) => ({
@@ -414,7 +443,19 @@ Please keep this email secure.`;
     set({ lastSyncTime });
   },
 
+  scheduleCloudSync: (delayMs = DEFAULT_SYNC_DEBOUNCE_MS) => {
+    scheduleCloudSync(delayMs);
+  },
+
+  flushCloudSync: () => {
+    flushCloudSync();
+  },
+
   syncWithCloud: async () => {
+    if (cloudSyncDebounceTimer !== null && typeof window !== 'undefined') {
+      window.clearTimeout(cloudSyncDebounceTimer);
+      cloudSyncDebounceTimer = null;
+    }
     const biz = get().activeBusiness;
     const dbInstance = get().currentDb;
     if (!biz || !dbInstance) {
@@ -462,6 +503,7 @@ Please keep this email secure.`;
     await dbInstance.roles.add(newRole);
     const updated = await dbInstance.roles.toArray();
     set({ roles: updated });
+    scheduleCloudSync();
     return newRole;
   },
 
@@ -484,6 +526,7 @@ Please keep this email secure.`;
 
     const updated = await dbInstance.roles.toArray();
     set({ roles: updated });
+    scheduleCloudSync();
   },
 
   deleteRoleDefinition: async (roleId) => {
@@ -504,6 +547,7 @@ Please keep this email secure.`;
     await dbInstance.roles.delete(roleId);
     const updated = await dbInstance.roles.toArray();
     set({ roles: updated });
+    scheduleCloudSync();
   },
 
   addUserRole: async (fullName: string, role: string, password = '123') => {
@@ -552,6 +596,7 @@ Please keep this email secure.`;
     await dbInstance.users.add(newUser);
     const updated = await dbInstance.users.toArray();
     set({ users: updated });
+    scheduleCloudSync();
     return newUser;
   },
 
@@ -634,6 +679,7 @@ Please keep this email secure.`;
     await dbInstance.users.delete(userId);
     const updated = await dbInstance.users.toArray();
     set({ users: updated });
+    scheduleCloudSync();
   },
 
   canAccess: (permission: PermissionKey) => {

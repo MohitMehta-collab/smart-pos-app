@@ -19,8 +19,9 @@ export interface ItemVariant {
   barcode?: string;
   quantityLeft: number;
   sellingPrice: number;
-  purchasePrice: number; // avg purchase price for this variant
-  threshold: number;
+  purchasePrice: number; // Individual cost price for this variant
+  threshold: number;     // Individual low stock threshold for this variant
+  shelfLocation?: string; // Individual shelf number for this variant
 }
 
 export interface StockItem {
@@ -29,7 +30,7 @@ export interface StockItem {
   name: string;
   hindiName?: string;
   category?: string;
-  shelfLocation: string; // Shelf number / where it is kept
+  shelfLocation: string; // Base shelf location
   unitType: UnitType; // count, weight, both
 
   // Aggregate stock if no variants, or base properties

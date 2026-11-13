@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { useTranslation } from 'react-i18next';
 import { StockService } from '../../services/stockService';
 import { ReceiptService } from '../../services/receiptService';
-import { useAppStore } from '../../store/useAppStore';
+import { useAppStore, scheduleCloudSync } from '../../store/useAppStore';
 import type {
   StockItem,
   ItemVariant,
@@ -693,6 +693,7 @@ export const CreateReceipt: React.FC<CreateReceiptProps> = ({
       await ReceiptService.saveReceipt(receiptToSave, false);
       savedReceipt = receiptToSave;
       setAutoSaveStatus('saved');
+      scheduleCloudSync();
     } catch (err) {
       console.error('Auto-save failed', err);
       setAutoSaveStatus('error');
@@ -849,55 +850,98 @@ export const CreateReceipt: React.FC<CreateReceiptProps> = ({
         `────────────────────\n` +
         `*ITEMIZED DETAILS (${filteredItems.length})*\n\n`;
 
+      // Group items chronologically by the date they were added
+      const dateGroupsMap = new Map<string, ReceiptItem[]>();
+      filteredItems.forEach((it) => {
+        const key = toLocalDateStr(it.addedAt || rec.createdAt) || 'unknown';
+        if (!dateGroupsMap.has(key)) dateGroupsMap.set(key, []);
+        dateGroupsMap.get(key)!.push(it);
+      });
+      const sortedDateEntries = Array.from(dateGroupsMap.entries()).sort(([a], [b]) =>
+        a.localeCompare(b)
+      );
+
       const itemsBlock =
         filteredItems.length === 0
           ? '_No items in selected date range_\n'
-          : filteredItems
-              .map((it, idx) => {
-                const variantParts = [
-                  it.variantDescription,
-                  [it.color, it.size].filter(Boolean).join(' '),
-                ].filter(Boolean);
-                const variantStr =
-                  variantParts.length > 0 ? ` (${variantParts.join(' • ')})` : '';
-                const returnTag = it.isReturn
-                  ? ` [RETURN${it.returnReason ? `: ${it.returnReason}` : ''}]`
-                  : '';
-                const qtyStr = `${it.quantity}${it.weight ? ` (${it.weight} kg)` : ''}`;
-                const discStr =
-                  it.discountAmount > 0
-                    ? ` | Disc: -${formatCurrency(it.discountAmount, currency)}`
-                    : '';
-                const addedDateStr = it.addedAt
-                  ? new Date(it.addedAt).toLocaleDateString('en-IN', {
-                      day: 'numeric',
-                      month: 'short',
-                      year: 'numeric',
-                    })
-                  : '';
+          : sortedDateEntries
+              .map(([dateKey, groupItems]) => {
+                const dateLabel =
+                  dateKey !== 'unknown'
+                    ? new Date(`${dateKey}T00:00:00`).toLocaleDateString('en-IN', {
+                        day: '2-digit',
+                        month: 'short',
+                        year: 'numeric',
+                      })
+                    : new Date(rec.createdAt).toLocaleDateString('en-IN', {
+                        day: '2-digit',
+                        month: 'short',
+                        year: 'numeric',
+                      });
 
-                return (
-                  `${idx + 1}. *${it.stockItemName}*${variantStr}${returnTag}\n` +
-                  `   • Qty: ${qtyStr} | Rate: ${formatCurrency(it.unitPrice, currency)}${discStr}\n` +
-                  `   • Amount: *${formatCurrency(it.totalPrice, currency)}*` +
-                  `${addedDateStr ? ` | Date: ${addedDateStr}` : ''}\n`
-                );
+                const daySubtotal = groupItems.reduce((s, it) => s + (it.totalPrice || 0), 0);
+
+                const groupLines = groupItems
+                  .map((it, idx) => {
+                    const variantParts = Array.from(
+                      new Set(
+                        [
+                          it.variantDescription,
+                          [it.color, it.size].filter(Boolean).join(' '),
+                        ].filter(Boolean)
+                      )
+                    );
+                    const variantStr =
+                      variantParts.length > 0 ? ` (${variantParts.join(' • ')})` : '';
+                    const returnTag = it.isReturn
+                      ? ` [RETURN${it.returnReason ? `: ${it.returnReason}` : ''}]`
+                      : '';
+                    const qtyStr = `${it.quantity}${it.weight ? ` (${it.weight} kg)` : ''}`;
+                    const discStr =
+                      it.discountAmount > 0
+                        ? ` | Disc: -${formatCurrency(it.discountAmount, currency)}`
+                        : '';
+
+                    return (
+                      `${idx + 1}. *${it.stockItemName}*${variantStr}${returnTag}\n` +
+                      `   • Qty: ${qtyStr} | Rate: ${formatCurrency(it.unitPrice, currency)}${discStr}\n` +
+                      `   • Amount: *${formatCurrency(it.totalPrice, currency)}* (Added: ${dateLabel})`
+                    );
+                  })
+                  .join('\n\n');
+
+                const dayFooter =
+                  sortedDateEntries.length > 1
+                    ? `\n   _Subtotal (${dateLabel}): ${formatCurrency(daySubtotal, currency)}_`
+                    : '';
+
+                return `📅 *Items Added on ${dateLabel}:*\n${groupLines}${dayFooter}`;
               })
-              .join('\n');
+              .join('\n\n');
+
+      const sortedPayments = [...filteredPayments].sort(
+        (a, b) => new Date(a.date || rec.createdAt).getTime() - new Date(b.date || rec.createdAt).getTime()
+      );
 
       const paymentsBlock =
-        filteredPayments.length > 0
-          ? `\n────────────────────\n*PAYMENTS (${filteredPayments.length})*\n` +
-            filteredPayments
-              .map(
-                (p, idx) =>
-                  `${idx + 1}. ${paymentMethodLabel(p.method)}: ${formatCurrency(p.amount, currency)} ` +
-                  `(${new Date(p.date).toLocaleDateString('en-IN')}` +
-                  `${p.transactionRef ? ` • Ref: #${p.transactionRef}` : ''})`
-              )
+        sortedPayments.length > 0
+          ? `\n────────────────────\n💳 *PAYMENT / DEPOSIT HISTORY (${sortedPayments.length})*\n` +
+            sortedPayments
+              .map((p, idx) => {
+                const payDateLabel = new Date(p.date || rec.createdAt).toLocaleDateString('en-IN', {
+                  day: '2-digit',
+                  month: 'short',
+                  year: 'numeric',
+                });
+                return (
+                  `${idx + 1}. 📅 ${payDateLabel}: *${formatCurrency(p.amount, currency)}* via *${paymentMethodLabel(p.method)}*` +
+                  `${p.transactionRef ? ` (Ref: #${p.transactionRef})` : ''}` +
+                  `${p.notes ? ` - ${p.notes}` : ''}`
+                );
+              })
               .join('\n') +
             '\n'
-          : '';
+          : '\n────────────────────\n💳 *PAYMENT / DEPOSIT HISTORY*\n_No payments deposited yet_\n';
 
       const totalsBlock =
         `\n────────────────────\n` +
@@ -1384,12 +1428,27 @@ export const CreateReceipt: React.FC<CreateReceiptProps> = ({
             {searchQuery.trim() && (
               <div className="mt-2 max-h-48 overflow-y-auto border border-slate-200 rounded-lg bg-white shadow-sm z-10">
                 {items
-                  .filter(
-                    (it) =>
-                      it.id.toLowerCase().includes(searchQuery.toLowerCase()) ||
-                      it.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-                      !!(it.hindiName && it.hindiName.toLowerCase().includes(searchQuery.toLowerCase()))
-                  )
+                  .filter((it) => {
+                    const q = searchQuery.toLowerCase();
+                    const matchesMain =
+                      it.id.toLowerCase().includes(q) ||
+                      it.name.toLowerCase().includes(q) ||
+                      !!(it.hindiName && it.hindiName.toLowerCase().includes(q)) ||
+                      !!(it.serialNumber && it.serialNumber.toLowerCase().includes(q)) ||
+                      it.shelfLocation.toLowerCase().includes(q);
+                    const matchesVar =
+                      it.hasVariants && it.variants
+                        ? it.variants.some(
+                            (v) =>
+                              v.id.toLowerCase().includes(q) ||
+                              !!(v.color && v.color.toLowerCase().includes(q)) ||
+                              !!(v.size && v.size.toLowerCase().includes(q)) ||
+                              !!(v.barcode && v.barcode.toLowerCase().includes(q)) ||
+                              !!(v.shelfLocation && v.shelfLocation.toLowerCase().includes(q))
+                          )
+                        : false;
+                    return matchesMain || matchesVar;
+                  })
                   .slice(0, 8)
                   .map((it) => {
                     const low = isLowStockCell(it);
@@ -1420,11 +1479,27 @@ export const CreateReceipt: React.FC<CreateReceiptProps> = ({
                       </button>
                     );
                   })}
-                {items.filter(
-                  (it) =>
-                    it.id.toLowerCase().includes(searchQuery.toLowerCase()) ||
-                    it.name.toLowerCase().includes(searchQuery.toLowerCase())
-                ).length === 0 && (
+                {items.filter((it) => {
+                  const q = searchQuery.toLowerCase();
+                  const matchesMain =
+                    it.id.toLowerCase().includes(q) ||
+                    it.name.toLowerCase().includes(q) ||
+                    !!(it.hindiName && it.hindiName.toLowerCase().includes(q)) ||
+                    !!(it.serialNumber && it.serialNumber.toLowerCase().includes(q)) ||
+                    it.shelfLocation.toLowerCase().includes(q);
+                  const matchesVar =
+                    it.hasVariants && it.variants
+                      ? it.variants.some(
+                          (v) =>
+                            v.id.toLowerCase().includes(q) ||
+                            !!(v.color && v.color.toLowerCase().includes(q)) ||
+                            !!(v.size && v.size.toLowerCase().includes(q)) ||
+                            !!(v.barcode && v.barcode.toLowerCase().includes(q)) ||
+                            !!(v.shelfLocation && v.shelfLocation.toLowerCase().includes(q))
+                        )
+                      : false;
+                  return matchesMain || matchesVar;
+                }).length === 0 && (
                   <div className="px-3 py-2 text-xs text-slate-400">No matching items</div>
                 )}
               </div>

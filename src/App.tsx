@@ -8,7 +8,7 @@ import { OrderHistory } from './features/history/OrderHistory';
 import { WhatsAppAssistant } from './features/whatsapp/WhatsAppAssistant';
 import { RolesManagement } from './features/roles/RolesManagement';
 import { Login } from './features/auth/Login';
-import { useAppStore } from './store/useAppStore';
+import { useAppStore, scheduleCloudSync, flushCloudSync } from './store/useAppStore';
 import type { PermissionKey } from './types';
 import { AlertCircle, ShieldAlert } from 'lucide-react';
 
@@ -55,19 +55,30 @@ function App() {
     };
     const handleOffline = () => setIsOnline(false);
 
-    window.addEventListener('online', handleOnline);
-    window.addEventListener('offline', handleOffline);
-
-    const syncInterval = window.setInterval(() => {
-      if (navigator.onLine) {
+    // Flush any pending debounced sync if the user switches tabs or closes the window,
+    // and pull latest updates when returning to the tab.
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        flushCloudSync();
+      } else if (document.visibilityState === 'visible' && navigator.onLine) {
         void syncWithCloud();
       }
-    }, 60000);
+    };
+
+    const handleBeforeUnload = () => {
+      flushCloudSync();
+    };
+
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('beforeunload', handleBeforeUnload);
 
     return () => {
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
-      window.clearInterval(syncInterval);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('beforeunload', handleBeforeUnload);
     };
   }, [initRegistry, setIsOnline, syncWithCloud]);
 
@@ -97,6 +108,7 @@ function App() {
   };
 
   const handleReceiptSaved = () => {
+    scheduleCloudSync();
     setEditingReceiptId(null);
     if (canAccess('view_dashboard')) {
       setActiveTab('dashboard');

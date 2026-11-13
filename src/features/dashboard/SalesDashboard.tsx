@@ -1,238 +1,321 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
-import { ReceiptService } from '../../services/receiptService';
-import { useAppStore } from '../../store/useAppStore';
 import type { SalesReceipt } from '../../types';
 import { formatCurrency } from '../../utils/pricing';
+import { useAppStore } from '../../store/useAppStore';
 import {
-  LayoutDashboard,
-  Clock,
+  groupReceiptItemsByDate,
+  formatReceiptShareText,
+  formatPaymentMethod,
+} from '../history/OrderHistory';
+import {
   TrendingUp,
+  DollarSign,
+  ShoppingBag,
   AlertCircle,
-  Edit,
-  RefreshCw,
+  Share2,
+  Edit3,
+  Calendar,
+  Eye,
+  X,
+  CreditCard,
 } from 'lucide-react';
 
 interface SalesDashboardProps {
-  onEditReceipt: (receiptId: string) => void;
+  onEditReceipt?: (id: string) => void;
 }
 
 export const SalesDashboard: React.FC<SalesDashboardProps> = ({ onEditReceipt }) => {
-  const { t, i18n } = useTranslation();
-  const { currency } = useAppStore();
-  const [activeReceipts, setActiveReceipts] = useState<SalesReceipt[]>([]);
-  const [isLoading, setIsLoading] = useState<boolean>(true);
+  const { t } = useTranslation();
+  const { currentDb, activeBusiness, currency, canAccess } = useAppStore();
+  const [receipts, setReceipts] = useState<SalesReceipt[]>([]);
+  const [previewReceipt, setPreviewReceipt] = useState<SalesReceipt | null>(null);
 
-  const locale = i18n.language?.startsWith('hi') ? 'hi-IN' : 'en-IN';
-
-  const loadData = useCallback(async () => {
-    setIsLoading(true);
-    try {
-      const data = await ReceiptService.getActiveDashboardReceipts();
-      setActiveReceipts(data);
-    } finally {
-      setIsLoading(false);
-    }
-  }, []);
+  const canEditReceipt = canAccess('edit_receipt') || canAccess('create_receipt');
 
   useEffect(() => {
-    loadData();
-  }, [loadData]);
+    async function load() {
+      if (!currentDb) return;
+      try {
+        const all = await currentDb.receipts.toArray();
+        const sorted = all.sort(
+          (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+        );
+        setReceipts(sorted);
+      } catch (err) {
+        console.error('Failed to load dashboard receipts', err);
+      }
+    }
+    void load();
+  }, [currentDb]);
 
-  const totalInProgressCount = activeReceipts.length;
-  const totalReceivableValue = activeReceipts.reduce((sum, r) => sum + r.grandTotal, 0);
-  const totalCollectedTillNow = activeReceipts.reduce((sum, r) => sum + r.amountReceived, 0);
-  const totalPendingBalance = activeReceipts.reduce((sum, r) => sum + r.balanceDue, 0);
+  const metrics = useMemo(() => {
+    const active = receipts.filter((r) => r.status !== 'cancelled');
+    const totalSales = active.reduce((sum, r) => sum + r.grandTotal, 0);
+    const totalReceived = active.reduce((sum, r) => sum + r.amountReceived, 0);
+    const totalDue = active.reduce((sum, r) => sum + r.balanceDue, 0);
+    return {
+      totalOrders: active.length,
+      totalSales,
+      totalReceived,
+      totalDue,
+    };
+  }, [receipts]);
+
+  const handleShareWhatsApp = (receipt: SalesReceipt) => {
+    const bizName = activeBusiness?.name || 'Smart POS';
+    const text = formatReceiptShareText(receipt, bizName, currency);
+    const phone = (receipt.customerPhone || '').replace(/\D/g, '');
+    const waUrl = phone
+      ? `https://wa.me/${phone.length === 10 ? `91${phone}` : phone}?text=${encodeURIComponent(text)}`
+      : `https://wa.me/?text=${encodeURIComponent(text)}`;
+    window.open(waUrl, '_blank', 'noopener,noreferrer');
+  };
 
   return (
     <div className="space-y-6">
-      {/* Dashboard Top Header */}
-      <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-xs flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
-        <div>
-          <h1 className="text-xl sm:text-2xl font-black text-slate-900 tracking-tight flex items-center gap-2">
-            <LayoutDashboard className="w-6 h-6 text-indigo-600" />
-            {t('dashboard.title', 'Sales Dashboard')}
-          </h1>
-          <p className="text-sm text-slate-500 mt-1">
-            {t('dashboard.subtitle', 'Live overview of open orders and pending balances')}
-          </p>
-        </div>
-
-        <button
-          onClick={loadData}
-          disabled={isLoading}
-          className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 disabled:opacity-50 text-slate-700 text-xs font-semibold transition"
-        >
-          <RefreshCw className={`w-3.5 h-3.5 ${isLoading ? 'animate-spin' : ''}`} />
-          {t('dashboard.refreshStatus', 'Refresh Live Status')}
-        </button>
+      <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-xs">
+        <h1 className="text-xl sm:text-2xl font-black text-slate-900 tracking-tight flex items-center gap-2">
+          <TrendingUp className="w-6 h-6 text-indigo-600" />
+          {t('dashboard.title', 'Sales Dashboard')}
+        </h1>
+        <p className="text-sm text-slate-500 mt-1">
+          Real-time revenue overview and recent multi-date orders
+        </p>
       </div>
 
-      {/* KPI Cards Grid */}
+      {/* KPI Cards */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-xs">
-          <div className="flex items-center justify-between">
-            <span className="text-xs font-bold uppercase tracking-wider text-slate-400">
-              {t('dashboard.inProgressCount', 'In-Progress Orders')}
-            </span>
-            <div className="p-2 rounded-lg bg-indigo-50 text-indigo-600">
-              <Clock className="w-4 h-4" />
-            </div>
+          <div className="flex items-center justify-between text-slate-500 text-xs font-bold uppercase">
+            <span>Total Revenue</span>
+            <DollarSign className="w-4 h-4 text-indigo-600" />
           </div>
-          <div className="text-3xl font-black text-slate-900 mt-3">
-            {totalInProgressCount}
+          <div className="text-2xl font-black text-slate-900 mt-2">
+            {formatCurrency(metrics.totalSales, currency)}
           </div>
-          <p className="text-xs text-slate-400 mt-1">
-            {t('dashboard.pendingCompletion', 'Pending completion')}
-          </p>
         </div>
 
         <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-xs">
-          <div className="flex items-center justify-between">
-            <span className="text-xs font-bold uppercase tracking-wider text-slate-400">
-              {t('dashboard.totalReceivable', 'Total Receivable')}
-            </span>
-            <div className="p-2 rounded-lg bg-blue-50 text-blue-600">
-              <TrendingUp className="w-4 h-4" />
-            </div>
+          <div className="flex items-center justify-between text-slate-500 text-xs font-bold uppercase">
+            <span>Amount Received</span>
+            <TrendingUp className="w-4 h-4 text-emerald-600" />
           </div>
-          <div className="text-2xl font-black text-slate-900 mt-3">
-            {formatCurrency(totalReceivableValue, currency)}
+          <div className="text-2xl font-black text-emerald-700 mt-2">
+            {formatCurrency(metrics.totalReceived, currency)}
           </div>
-          <p className="text-xs text-slate-400 mt-1">
-            {t('dashboard.totalValueOpenBills', 'Total value of open bills')}
-          </p>
         </div>
 
         <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-xs">
-          <div className="flex items-center justify-between">
-            <span className="text-xs font-bold uppercase tracking-wider text-slate-400">
-              {t('dashboard.amountCollected', 'Amount Collected')}
-            </span>
-            <div className="p-2 rounded-lg bg-emerald-50 text-emerald-600">
-              <TrendingUp className="w-4 h-4" />
-            </div>
+          <div className="flex items-center justify-between text-slate-500 text-xs font-bold uppercase">
+            <span>Pending Balance Due</span>
+            <AlertCircle className="w-4 h-4 text-rose-600" />
           </div>
-          <div className="text-2xl font-black text-emerald-600 mt-3">
-            {formatCurrency(totalCollectedTillNow, currency)}
+          <div className="text-2xl font-black text-rose-600 mt-2">
+            {formatCurrency(metrics.totalDue, currency)}
           </div>
-          <p className="text-xs text-emerald-700/70 mt-1">
-            {t('dashboard.collectedAdvance', 'Collected advance / partial')}
-          </p>
         </div>
 
         <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-xs">
-          <div className="flex items-center justify-between">
-            <span className="text-xs font-bold uppercase tracking-wider text-slate-400">
-              {t('dashboard.dueBalance', 'Due Balance')}
-            </span>
-            <div className="p-2 rounded-lg bg-amber-50 text-amber-600">
-              <AlertCircle className="w-4 h-4" />
-            </div>
+          <div className="flex items-center justify-between text-slate-500 text-xs font-bold uppercase">
+            <span>Total Orders</span>
+            <ShoppingBag className="w-4 h-4 text-blue-600" />
           </div>
-          <div className="text-2xl font-black text-amber-600 mt-3">
-            {formatCurrency(totalPendingBalance, currency)}
-          </div>
-          <p className="text-xs text-amber-700/70 mt-1">
-            {t('dashboard.remainingToCollect', 'Remaining to collect')}
-          </p>
+          <div className="text-2xl font-black text-slate-900 mt-2">{metrics.totalOrders}</div>
         </div>
       </div>
 
-      {/* Active In-Progress Receipts Table */}
+      {/* Recent Receipts List */}
       <div className="bg-white border border-slate-200 rounded-2xl shadow-xs overflow-hidden">
-        <div className="p-5 border-b border-slate-200 flex items-center justify-between">
-          <h2 className="text-sm font-bold text-slate-900 flex items-center gap-2">
-            <Clock className="w-4 h-4 text-indigo-600" />
-            {t('dashboard.openReceipts', 'Open Receipts')} ({activeReceipts.length})
-          </h2>
-          <span className="text-xs text-slate-400">
-            {t('dashboard.realTimeSynced', 'Offline-ready synced')}
-          </span>
+        <div className="px-5 py-4 border-b border-slate-200 flex items-center justify-between">
+          <h2 className="text-sm font-bold text-slate-900">Recent Receipts</h2>
         </div>
-
         <div className="overflow-x-auto">
-          <table className="w-full text-left border-collapse text-xs">
+          <table className="w-full text-left border-collapse text-sm">
             <thead>
-              <tr className="bg-slate-50 border-b border-slate-200 text-slate-500 font-semibold uppercase">
-                <th className="py-3 px-4">{t('receipt.number', 'Receipt #')}</th>
-                <th className="py-3 px-4">{t('customer.name', 'Customer Name')}</th>
-                <th className="py-3 px-4">{t('customer.phone', 'Phone Number')}</th>
-                <th className="py-3 px-4">{t('receipt.startDate', 'Start Date')}</th>
-                <th className="py-3 px-4 text-center">{t('receipt.status', 'Status')}</th>
-                <th className="py-3 px-4 text-right">{t('receipt.totalAmount', 'Total Amount')}</th>
-                <th className="py-3 px-4 text-right">{t('receipt.amountReceived', 'Amount Received')}</th>
-                <th className="py-3 px-4 text-right">{t('receipt.balanceDue', 'Balance Due')}</th>
-                <th className="py-3 px-4 text-center">{t('common.action', 'Action')}</th>
+              <tr className="bg-slate-50/80 border-b border-slate-200 text-xs font-semibold text-slate-500 uppercase">
+                <th className="py-3 px-4">Receipt #</th>
+                <th className="py-3 px-4">Customer</th>
+                <th className="py-3 px-4">Dates Added</th>
+                <th className="py-3 px-4 text-right">Total</th>
+                <th className="py-3 px-4 text-right">Due</th>
+                <th className="py-3 px-4 text-center">Actions</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
-              {activeReceipts.length === 0 ? (
-                <tr>
-                  <td colSpan={9} className="py-12 text-center text-slate-400">
-                    {t(
-                      'dashboard.noActiveReceipts',
-                      'No active in-progress or paused receipts. All orders completed!'
-                    )}
-                  </td>
-                </tr>
-              ) : (
-                activeReceipts.map((rec) => (
-                  <tr key={rec.id} className="hover:bg-slate-50 transition">
-                    <td className="py-3.5 px-4 font-mono font-bold text-indigo-600">
-                      {rec.id}
+              {receipts.slice(0, 15).map((r) => {
+                const dateGroups = groupReceiptItemsByDate(r.items, r.createdAt);
+                return (
+                  <tr key={r.id} className="hover:bg-slate-50/80 transition">
+                    <td className="py-3.5 px-4 font-mono text-xs font-bold text-indigo-700">
+                      {r.id}
                     </td>
-                    <td className="py-3.5 px-4 font-semibold text-slate-900">
-                      {rec.customerName || rec.customer?.name || t('customer.walkIn', 'Walk-in Customer')}
+                    <td className="py-3.5 px-4">
+                      <div className="font-semibold text-slate-900">{r.customerName}</div>
+                      {r.customerPhone && (
+                        <div className="text-xs text-slate-500">{r.customerPhone}</div>
+                      )}
                     </td>
-                    <td className="py-3.5 px-4 text-slate-600 font-mono">
-                      {rec.customerPhone || rec.customer?.phone || '—'}
+                    <td className="py-3.5 px-4">
+                      <div className="flex flex-wrap gap-1">
+                        {dateGroups.map((g) => (
+                          <span
+                            key={g.isoDateKey}
+                            className="inline-flex items-center gap-1 text-[10px] font-semibold bg-indigo-50 text-indigo-700 px-2 py-0.5 rounded border border-indigo-100"
+                          >
+                            <Calendar className="w-2.5 h-2.5" />
+                            {g.dateLabel} ({g.items.length})
+                          </span>
+                        ))}
+                      </div>
                     </td>
-                    <td className="py-3.5 px-4 text-slate-500">
-                      {new Date(rec.createdAt).toLocaleDateString(locale, {
-                        day: 'numeric',
-                        month: 'short',
-                        year: 'numeric',
-                        hour: '2-digit',
-                        minute: '2-digit',
-                      })}
+                    <td className="py-3.5 px-4 text-right font-bold text-slate-900">
+                      {formatCurrency(r.grandTotal, currency)}
                     </td>
-                    <td className="py-3.5 px-4 text-center">
-                      <span
-                        className={`inline-block px-2.5 py-0.5 rounded-full font-bold text-[10px] uppercase tracking-wider ${
-                          rec.status === 'inProgress'
-                            ? 'bg-blue-100 text-blue-800'
-                            : 'bg-amber-100 text-amber-800'
-                        }`}
-                      >
-                        {t(`status.${rec.status}`, rec.status)}
-                      </span>
-                    </td>
-                    <td className="py-3.5 px-4 text-right font-black text-slate-900">
-                      {formatCurrency(rec.grandTotal, currency)}
-                    </td>
-                    <td className="py-3.5 px-4 text-right font-bold text-emerald-600">
-                      {formatCurrency(rec.amountReceived, currency)}
-                    </td>
-                    <td className="py-3.5 px-4 text-right font-bold text-amber-600">
-                      {formatCurrency(rec.balanceDue, currency)}
+                    <td className="py-3.5 px-4 text-right font-bold text-rose-600">
+                      {formatCurrency(r.balanceDue, currency)}
                     </td>
                     <td className="py-3.5 px-4 text-center">
-                      <button
-                        onClick={() => onEditReceipt(rec.id)}
-                        className="inline-flex items-center px-3 py-1.5 rounded-lg bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-semibold text-xs transition"
-                      >
-                        <Edit className="w-3.5 h-3.5 mr-1" />
-                        {t('dashboard.editComplete', 'Edit / Complete')}
-                      </button>
+                      <div className="flex items-center justify-center gap-1.5">
+                        <button
+                          onClick={() => setPreviewReceipt(r)}
+                          className="p-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 transition"
+                          title="Preview Receipt by Date"
+                        >
+                          <Eye className="w-4 h-4" />
+                        </button>
+                        <button
+                          onClick={() => handleShareWhatsApp(r)}
+                          className="p-1.5 rounded-lg bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 transition"
+                          title="Share Receipt with Item & Payment Dates"
+                        >
+                          <Share2 className="w-4 h-4" />
+                        </button>
+                        {canEditReceipt && onEditReceipt && (
+                          <button
+                            onClick={() => onEditReceipt(r.id)}
+                            className="p-1.5 rounded-lg bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200 transition"
+                            title="Edit Receipt"
+                          >
+                            <Edit3 className="w-4 h-4" />
+                          </button>
+                        )}
+                      </div>
                     </td>
                   </tr>
-                ))
-              )}
+                );
+              })}
             </tbody>
           </table>
         </div>
       </div>
+
+      {/* Preview Modal */}
+      {previewReceipt && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-xs p-4">
+          <div className="bg-white rounded-2xl max-w-xl w-full p-6 shadow-2xl border border-slate-100 space-y-4 max-h-[90vh] overflow-y-auto">
+            <div className="flex items-center justify-between border-b pb-3 border-slate-100">
+              <div>
+                <h3 className="font-bold text-lg text-slate-900">Receipt {previewReceipt.id}</h3>
+                <p className="text-xs text-slate-500">{previewReceipt.customerName}</p>
+              </div>
+              <button
+                onClick={() => setPreviewReceipt(null)}
+                className="text-slate-400 hover:text-slate-600 p-1"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="space-y-3">
+              {groupReceiptItemsByDate(previewReceipt.items, previewReceipt.createdAt).map((g) => (
+                <div key={g.isoDateKey} className="border border-slate-200 rounded-xl overflow-hidden">
+                  <div className="bg-indigo-50 px-3.5 py-2 border-b border-slate-200 flex justify-between text-xs font-bold text-indigo-900">
+                    <span>Added on: {g.dateLabel}</span>
+                    <span>{formatCurrency(g.daySubtotal, currency)}</span>
+                  </div>
+                  <div className="divide-y divide-slate-100">
+                    {g.items.map((item) => (
+                      <div key={item.id} className="p-2.5 text-xs flex justify-between">
+                        <span>
+                          <strong>{item.stockItemName}</strong> × {item.quantity}
+                        </span>
+                        <span className="font-bold">
+                          {formatCurrency(item.totalPrice, currency)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* Payment / Deposit History in Preview Modal */}
+            <div className="border border-slate-200 rounded-xl overflow-hidden">
+              <div className="bg-emerald-50 px-3.5 py-2 border-b border-slate-200 flex justify-between text-xs font-bold text-emerald-900">
+                <span className="flex items-center gap-1.5">
+                  <CreditCard className="w-3.5 h-3.5 text-emerald-600" />
+                  Payment / Deposit History
+                </span>
+                <span>Total Paid: {formatCurrency(previewReceipt.amountReceived, currency)}</span>
+              </div>
+              {previewReceipt.payments && previewReceipt.payments.length > 0 ? (
+                <div className="divide-y divide-slate-100">
+                  {[...previewReceipt.payments]
+                    .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime())
+                    .map((p, idx) => {
+                      const pDate = new Date(p.date);
+                      const dateStr = isNaN(pDate.getTime())
+                        ? p.date
+                        : pDate.toLocaleDateString('en-IN', {
+                            day: '2-digit',
+                            month: 'short',
+                            year: 'numeric',
+                          });
+                      return (
+                        <div key={p.id || idx} className="p-2.5 text-xs flex justify-between items-center">
+                          <div>
+                            <span className="font-semibold text-slate-800">{dateStr}</span>
+                            <span className="ml-2 px-1.5 py-0.5 bg-emerald-100 text-emerald-800 rounded text-[10px] font-bold uppercase">
+                              {formatPaymentMethod(p.method)}
+                            </span>
+                            {p.transactionRef && (
+                              <span className="ml-1.5 text-[11px] text-slate-500">
+                                (Ref: {p.transactionRef})
+                              </span>
+                            )}
+                          </div>
+                          <span className="font-bold text-emerald-700">
+                            +{formatCurrency(p.amount, currency)}
+                          </span>
+                        </div>
+                      );
+                    })}
+                </div>
+              ) : (
+                <div className="p-2.5 text-xs text-slate-400 text-center">
+                  No deposits recorded yet.
+                </div>
+              )}
+            </div>
+
+            <div className="flex gap-2 pt-2">
+              <button
+                onClick={() => handleShareWhatsApp(previewReceipt)}
+                className="flex-1 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold flex items-center justify-center gap-1.5"
+              >
+                <Share2 className="w-4 h-4" /> Share on WhatsApp (With Dates & Payments)
+              </button>
+              <button
+                onClick={() => setPreviewReceipt(null)}
+                className="py-2.5 px-4 rounded-xl border border-slate-300 text-xs font-semibold text-slate-700"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
