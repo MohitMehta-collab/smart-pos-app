@@ -202,6 +202,35 @@ export const StockManagement: React.FC = () => {
     }
   };
 
+  const handleDeleteCategory = async (cat: { id: string; name: string }) => {
+    const assignedCount = items.filter((i) => i.category === cat.id).length;
+    const warningMsg =
+      assignedCount > 0
+        ? `Delete category "${cat.name}"? ${assignedCount} item(s) in this category will be moved to Uncategorized.`
+        : `Delete category "${cat.name}"?`;
+
+    if (!window.confirm(warningMsg)) return;
+
+    try {
+      await StockService.deleteCategory(cat.id);
+      if (editingCategoryId === cat.id) {
+        setEditingCategoryId(null);
+        setEditingCategoryName('');
+      }
+      if (categoryFilter === cat.id) {
+        setCategoryFilter('all');
+      }
+      if (newItemCategory === cat.id) {
+        setNewItemCategory('');
+      }
+      await loadCategories();
+      await loadStock();
+      scheduleCloudSync();
+    } catch (err: any) {
+      alert(err?.message || 'Failed to delete category');
+    }
+  };
+
   // Variant Builder Helpers
   const handleAddVariantRow = () => {
     setVariantsList((prev) => [
@@ -842,14 +871,24 @@ export const StockManagement: React.FC = () => {
                         {group.name} ({group.items.length} items)
                       </h3>
                       {canEditStock && group.isRealCategory && (
-                        <button
-                          type="button"
-                          onClick={() => openCategoryModal({ id: group.id, name: group.name })}
-                          className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-semibold rounded-md bg-white/80 hover:bg-white text-indigo-700 border border-indigo-200 transition"
-                          title="Edit category name"
-                        >
-                          <Edit3 className="w-3 h-3" /> Edit
-                        </button>
+                        <div className="inline-flex items-center gap-1">
+                          <button
+                            type="button"
+                            onClick={() => openCategoryModal({ id: group.id, name: group.name })}
+                            className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-semibold rounded-md bg-white/80 hover:bg-white text-indigo-700 border border-indigo-200 transition"
+                            title="Edit category name"
+                          >
+                            <Edit3 className="w-3 h-3" /> Edit
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleDeleteCategory({ id: group.id, name: group.name })}
+                            className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-semibold rounded-md bg-white/80 hover:bg-rose-50 text-rose-600 border border-rose-200 transition"
+                            title="Delete category"
+                          >
+                            <Trash2 className="w-3 h-3" /> Delete
+                          </button>
+                        </div>
                       )}
                     </div>
                     {allCountBased && (
@@ -1897,16 +1936,26 @@ export const StockManagement: React.FC = () => {
                             <span className="text-sm font-medium text-slate-800 px-1">
                               {cat.name}
                             </span>
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setEditingCategoryId(cat.id);
-                                setEditingCategoryName(cat.name);
-                              }}
-                              className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold rounded-lg bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200 transition"
-                            >
-                              <Edit3 className="w-3 h-3" /> Edit
-                            </button>
+                            <div className="flex items-center gap-1.5">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setEditingCategoryId(cat.id);
+                                  setEditingCategoryName(cat.name);
+                                }}
+                                className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold rounded-lg bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200 transition"
+                              >
+                                <Edit3 className="w-3 h-3" /> Edit
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleDeleteCategory(cat)}
+                                className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 transition"
+                                title="Delete category"
+                              >
+                                <Trash2 className="w-3 h-3" /> Delete
+                              </button>
+                            </div>
                           </>
                         )}
                       </div>

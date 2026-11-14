@@ -794,7 +794,7 @@ export const CreateReceipt: React.FC<CreateReceiptProps> = ({
 
   const buildSingleReceiptShareMessage = useCallback(
     (rec: SalesReceipt, range?: { from?: string; to?: string }) => {
-      const bizName = activeBusiness?.name || 'ANCHAL FURNITURE';
+      const bizName = activeBusiness?.name || 'Smart POS Store';
       const createdDate = new Date(rec.createdAt).toLocaleString('en-IN', {
         day: 'numeric',
         month: 'short',
@@ -967,7 +967,7 @@ export const CreateReceipt: React.FC<CreateReceiptProps> = ({
       if (list.length === 1) {
         return buildSingleReceiptShareMessage(list[0], range);
       }
-      const bizName = activeBusiness?.name || 'ANCHAL FURNITURE';
+      const bizName = activeBusiness?.name || 'Smart POS Store';
       const today = new Date().toLocaleDateString('en-IN', {
         day: 'numeric',
         month: 'long',

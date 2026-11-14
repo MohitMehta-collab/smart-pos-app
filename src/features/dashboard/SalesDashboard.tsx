@@ -19,6 +19,8 @@ import {
   Eye,
   X,
   CreditCard,
+  Clock,
+  PauseCircle,
 } from 'lucide-react';
 
 interface SalesDashboardProps {
@@ -49,18 +51,23 @@ export const SalesDashboard: React.FC<SalesDashboardProps> = ({ onEditReceipt })
     void load();
   }, [currentDb]);
 
+  // Only show ongoing / in-progress receipts on the Sales Dashboard (completed & cancelled belong in Order History)
+  const inProgressReceipts = useMemo(() => {
+    return receipts.filter((r) => r.status === 'inProgress' || r.status === 'paused');
+  }, [receipts]);
+
   const metrics = useMemo(() => {
     const active = receipts.filter((r) => r.status !== 'cancelled');
     const totalSales = active.reduce((sum, r) => sum + r.grandTotal, 0);
     const totalReceived = active.reduce((sum, r) => sum + r.amountReceived, 0);
-    const totalDue = active.reduce((sum, r) => sum + r.balanceDue, 0);
+    const totalDue = inProgressReceipts.reduce((sum, r) => sum + r.balanceDue, 0);
     return {
-      totalOrders: active.length,
+      activeInProgressCount: inProgressReceipts.length,
       totalSales,
       totalReceived,
       totalDue,
     };
-  }, [receipts]);
+  }, [receipts, inProgressReceipts]);
 
   const handleShareWhatsApp = (receipt: SalesReceipt) => {
     const bizName = activeBusiness?.name || 'Smart POS';
@@ -72,6 +79,21 @@ export const SalesDashboard: React.FC<SalesDashboardProps> = ({ onEditReceipt })
     window.open(waUrl, '_blank', 'noopener,noreferrer');
   };
 
+  const renderStatusBadge = (status: SalesReceipt['status']) => {
+    if (status === 'paused') {
+      return (
+        <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-amber-100 text-amber-800">
+          <PauseCircle className="w-3 h-3" /> Paused
+        </span>
+      );
+    }
+    return (
+      <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-blue-100 text-blue-800">
+        <Clock className="w-3 h-3" /> In Progress
+      </span>
+    );
+  };
+
   return (
     <div className="space-y-6">
       <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-xs">
@@ -80,7 +102,7 @@ export const SalesDashboard: React.FC<SalesDashboardProps> = ({ onEditReceipt })
           {t('dashboard.title', 'Sales Dashboard')}
         </h1>
         <p className="text-sm text-slate-500 mt-1">
-          Real-time revenue overview and recent multi-date orders
+          Active in-progress orders and real-time revenue overview (completed receipts move to Order History)
         </p>
       </div>
 
@@ -118,17 +140,26 @@ export const SalesDashboard: React.FC<SalesDashboardProps> = ({ onEditReceipt })
 
         <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-xs">
           <div className="flex items-center justify-between text-slate-500 text-xs font-bold uppercase">
-            <span>Total Orders</span>
+            <span>In-Progress Orders</span>
             <ShoppingBag className="w-4 h-4 text-blue-600" />
           </div>
-          <div className="text-2xl font-black text-slate-900 mt-2">{metrics.totalOrders}</div>
+          <div className="text-2xl font-black text-slate-900 mt-2">
+            {metrics.activeInProgressCount}
+          </div>
         </div>
       </div>
 
-      {/* Recent Receipts List */}
+      {/* Active In-Progress Receipts List */}
       <div className="bg-white border border-slate-200 rounded-2xl shadow-xs overflow-hidden">
         <div className="px-5 py-4 border-b border-slate-200 flex items-center justify-between">
-          <h2 className="text-sm font-bold text-slate-900">Recent Receipts</h2>
+          <div className="flex items-center gap-2">
+            <h2 className="text-sm font-bold text-slate-900">
+              In-Progress Receipts ({inProgressReceipts.length})
+            </h2>
+          </div>
+          <span className="text-xs text-slate-500">
+            Completed orders are archived in Order History
+          </span>
         </div>
         <div className="overflow-x-auto">
           <table className="w-full text-left border-collapse text-sm">
@@ -136,6 +167,7 @@ export const SalesDashboard: React.FC<SalesDashboardProps> = ({ onEditReceipt })
               <tr className="bg-slate-50/80 border-b border-slate-200 text-xs font-semibold text-slate-500 uppercase">
                 <th className="py-3 px-4">Receipt #</th>
                 <th className="py-3 px-4">Customer</th>
+                <th className="py-3 px-4">Status</th>
                 <th className="py-3 px-4">Dates Added</th>
                 <th className="py-3 px-4 text-right">Total</th>
                 <th className="py-3 px-4 text-right">Due</th>
@@ -143,68 +175,77 @@ export const SalesDashboard: React.FC<SalesDashboardProps> = ({ onEditReceipt })
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
-              {receipts.slice(0, 15).map((r) => {
-                const dateGroups = groupReceiptItemsByDate(r.items, r.createdAt);
-                return (
-                  <tr key={r.id} className="hover:bg-slate-50/80 transition">
-                    <td className="py-3.5 px-4 font-mono text-xs font-bold text-indigo-700">
-                      {r.id}
-                    </td>
-                    <td className="py-3.5 px-4">
-                      <div className="font-semibold text-slate-900">{r.customerName}</div>
-                      {r.customerPhone && (
-                        <div className="text-xs text-slate-500">{r.customerPhone}</div>
-                      )}
-                    </td>
-                    <td className="py-3.5 px-4">
-                      <div className="flex flex-wrap gap-1">
-                        {dateGroups.map((g) => (
-                          <span
-                            key={g.isoDateKey}
-                            className="inline-flex items-center gap-1 text-[10px] font-semibold bg-indigo-50 text-indigo-700 px-2 py-0.5 rounded border border-indigo-100"
-                          >
-                            <Calendar className="w-2.5 h-2.5" />
-                            {g.dateLabel} ({g.items.length})
-                          </span>
-                        ))}
-                      </div>
-                    </td>
-                    <td className="py-3.5 px-4 text-right font-bold text-slate-900">
-                      {formatCurrency(r.grandTotal, currency)}
-                    </td>
-                    <td className="py-3.5 px-4 text-right font-bold text-rose-600">
-                      {formatCurrency(r.balanceDue, currency)}
-                    </td>
-                    <td className="py-3.5 px-4 text-center">
-                      <div className="flex items-center justify-center gap-1.5">
-                        <button
-                          onClick={() => setPreviewReceipt(r)}
-                          className="p-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 transition"
-                          title="Preview Receipt by Date"
-                        >
-                          <Eye className="w-4 h-4" />
-                        </button>
-                        <button
-                          onClick={() => handleShareWhatsApp(r)}
-                          className="p-1.5 rounded-lg bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 transition"
-                          title="Share Receipt with Item & Payment Dates"
-                        >
-                          <Share2 className="w-4 h-4" />
-                        </button>
-                        {canEditReceipt && onEditReceipt && (
-                          <button
-                            onClick={() => onEditReceipt(r.id)}
-                            className="p-1.5 rounded-lg bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200 transition"
-                            title="Edit Receipt"
-                          >
-                            <Edit3 className="w-4 h-4" />
-                          </button>
+              {inProgressReceipts.length === 0 ? (
+                <tr>
+                  <td colSpan={7} className="py-12 text-center text-slate-400">
+                    No in-progress receipts right now. Completed receipts can be viewed in Order History.
+                  </td>
+                </tr>
+              ) : (
+                inProgressReceipts.map((r) => {
+                  const dateGroups = groupReceiptItemsByDate(r.items, r.createdAt);
+                  return (
+                    <tr key={r.id} className="hover:bg-slate-50/80 transition">
+                      <td className="py-3.5 px-4 font-mono text-xs font-bold text-indigo-700">
+                        {r.id}
+                      </td>
+                      <td className="py-3.5 px-4">
+                        <div className="font-semibold text-slate-900">{r.customerName}</div>
+                        {r.customerPhone && (
+                          <div className="text-xs text-slate-500">{r.customerPhone}</div>
                         )}
-                      </div>
-                    </td>
-                  </tr>
-                );
-              })}
+                      </td>
+                      <td className="py-3.5 px-4">{renderStatusBadge(r.status)}</td>
+                      <td className="py-3.5 px-4">
+                        <div className="flex flex-wrap gap-1">
+                          {dateGroups.map((g) => (
+                            <span
+                              key={g.isoDateKey}
+                              className="inline-flex items-center gap-1 text-[10px] font-semibold bg-indigo-50 text-indigo-700 px-2 py-0.5 rounded border border-indigo-100"
+                            >
+                              <Calendar className="w-2.5 h-2.5" />
+                              {g.dateLabel} ({g.items.length})
+                            </span>
+                          ))}
+                        </div>
+                      </td>
+                      <td className="py-3.5 px-4 text-right font-bold text-slate-900">
+                        {formatCurrency(r.grandTotal, currency)}
+                      </td>
+                      <td className="py-3.5 px-4 text-right font-bold text-rose-600">
+                        {formatCurrency(r.balanceDue, currency)}
+                      </td>
+                      <td className="py-3.5 px-4 text-center">
+                        <div className="flex items-center justify-center gap-1.5">
+                          <button
+                            onClick={() => setPreviewReceipt(r)}
+                            className="p-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 transition"
+                            title="Preview Receipt by Date"
+                          >
+                            <Eye className="w-4 h-4" />
+                          </button>
+                          <button
+                            onClick={() => handleShareWhatsApp(r)}
+                            className="p-1.5 rounded-lg bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 transition"
+                            title="Share Receipt with Item & Payment Dates"
+                          >
+                            <Share2 className="w-4 h-4" />
+                          </button>
+                          {canEditReceipt && onEditReceipt && (
+                            <button
+                              onClick={() => onEditReceipt(r.id)}
+                              className="p-1.5 rounded-lg bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200 transition"
+                              title="Edit Receipt"
+                            >
+                              <Edit3 className="w-4 h-4" />
+                            </button>
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })
+              )}
             </tbody>
           </table>
         </div>
@@ -216,7 +257,10 @@ export const SalesDashboard: React.FC<SalesDashboardProps> = ({ onEditReceipt })
           <div className="bg-white rounded-2xl max-w-xl w-full p-6 shadow-2xl border border-slate-100 space-y-4 max-h-[90vh] overflow-y-auto">
             <div className="flex items-center justify-between border-b pb-3 border-slate-100">
               <div>
-                <h3 className="font-bold text-lg text-slate-900">Receipt {previewReceipt.id}</h3>
+                <h3 className="font-bold text-lg text-slate-900 flex items-center gap-2">
+                  Receipt {previewReceipt.id}
+                  {renderStatusBadge(previewReceipt.status)}
+                </h3>
                 <p className="text-xs text-slate-500">{previewReceipt.customerName}</p>
               </div>
               <button

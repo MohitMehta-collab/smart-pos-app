@@ -224,7 +224,7 @@ export const StockService = {
   },
 
   /**
-   * Update an existing category's display name
+   *Update an existing category's display name
    */
   async updateCategory(id: string, name: string): Promise<void> {
     const db = getDb();
@@ -239,6 +239,25 @@ export const StockService = {
     await db.categories.update(id, {
       name: trimmed,
       updatedAt: new Date().toISOString(),
+    });
+    scheduleCloudSync();
+  },
+
+  /**
+   * Delete a category by ID and unassign it from any items using it
+   */
+  async deleteCategory(id: string): Promise<void> {
+    const db = getDb();
+    await db.transaction('rw', db.categories, db.stockItems, async () => {
+      await db.categories.delete(id);
+      const affectedItems = await db.stockItems.filter((item) => item.category === id).toArray();
+      const now = new Date().toISOString();
+      for (const item of affectedItems) {
+        await db.stockItems.update(item.id, {
+          category: '',
+          updatedAt: now,
+        });
+      }
     });
     scheduleCloudSync();
   },

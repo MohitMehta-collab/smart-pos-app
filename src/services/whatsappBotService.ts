@@ -1,6 +1,13 @@
-import { useAppStore } from '../store/useAppStore';
-import type { StockItem } from '../types';
+import { useAppStore, scheduleCloudSync } from '../store/useAppStore';
+import type { SalesReceipt, PaymentEntry, UserRole } from '../types';
 import { formatCurrency, formatQuantity } from '../utils/pricing';
+import { groupReceiptItemsByDate, formatPaymentMethod } from '../features/history/OrderHistory';
+
+export interface BotResponse {
+  reply: string;
+  timestamp: string;
+  actionPerformed?: boolean;
+}
 
 const getDb = () => {
   const db = useAppStore.getState().currentDb;
@@ -8,253 +15,469 @@ const getDb = () => {
   return db;
 };
 
-export interface BotResponse {
-  reply: string;
-  success: boolean;
-  timestamp: string;
-  authorized: boolean;
-}
-
-/**
- * Parses English and Hindi WhatsApp messages and executes stock/order queries.
- *
- * Supported Command Patterns (English & Hindi):
- * 1. Full Stock:
- *    - "stock", "all stock", "full stock", "list stock"
- *    - "स्टॉक", "सारा स्टॉक", "पूरा स्टॉक", "स्टॉक लिस्ट"
- *
- * 2. Specific Item Stock:
- *    - "item ITEM-101", "stock shirt", "check rice"
- *    - "सामान ITEM-101", "शर्ट स्टॉक", "चावल कितना है"
- *
- * 3. Customer Order History:
- *    - "orders 9876543210", "history John", "customer 9876543210"
- *    - "ऑर्डर 9876543210", "ग्राहक का बिल", "इतिहास 9876543210"
- *
- * 4. Sync Status:
- *    - "sync status", "last sync", "सिंक स्थिति", "अंतिम सिंक"
- */
 export const WhatsAppBotService = {
-  /**
-   * Process incoming WhatsApp text query with role-based check
-   */
   async handleIncomingMessage(
-    senderPhone: string,
-    messageText: string,
-    senderRole: 'admin' | 'manager' | 'cashier' | 'unauthorized' = 'admin'
+    _sender: string,
+    rawMessage: string,
+    userRole: UserRole = 'admin'
   ): Promise<BotResponse> {
-    const timestamp = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+    const db = getDb();
+    const state = useAppStore.getState();
+    const currency = state.currency || 'INR';
+    const bizName = state.activeBusiness?.name || 'Smart POS';
+    const canViewCost = state.canAccess('view_cost_price') || userRole === 'admin';
+    const canEditReceipt =
+      state.canAccess('edit_receipt') || state.canAccess('create_receipt') || userRole === 'admin';
 
-    // 1. Role-based Access Constraint
-    if (senderRole !== 'admin' && senderRole !== 'manager') {
+    const msg = rawMessage.trim();
+    const lower = msg.toLowerCase();
+    const timestamp = new Date().toLocaleString('en-IN', {
+      hour: '2-digit',
+      minute: '2-digit',
+      day: '2-digit',
+      month: 'short',
+    });
+
+    // 1. HELP / मदद
+    if (lower === 'help' || lower === 'मदद' || lower === 'menu' || lower === 'commands') {
       return {
-        reply: `🚫 *Access Denied / अनुमति नहीं है*\nYour phone number (${senderPhone}) is not registered with Admin or Manager remote access privileges.\nकृपया व्यवस्थापक (Admin) से संपर्क करें।`,
-        success: false,
         timestamp,
-        authorized: false,
+        reply: [
+          `🤖 *${bizName} — Assistant Commands*`,
+          `────────────────────`,
+          `📦 *Inventory & Variants*`,
+          `• *"full stock"* — List all items & variant stock`,
+          `• *"low"* or *"low stock"* — Restock alert list for suppliers`,
+          `• *"stock <query>"* or *"सामान <नाम>"* — Search by name, SKU, variant serial, color/size, or shelf`,
+          `• *"shelf <no>"* — View all items/variants kept on a shelf`,
+          ``,
+          `🧾 *Orders, Dues & Reports*`,
+          `• *"dues"* or *"udhaar"* — List all customers with pending balance`,
+          `• *"today"* or *"summary"* — Today's sales & collection report`,
+          `• *"orders <phone/name/REC#>"* — Customer bill & deposit history`,
+          ``,
+          `⚡ *Quick Actions*`,
+          `• *"pay <REC-ID> <amount> <mode>"* — Record customer payment (e.g. _pay REC-2026-0001 5000 upi_)`,
+        ].join('\n'),
       };
     }
 
-    const text = messageText.trim().toLowerCase();
+    // 2. FULL STOCK
+    if (lower === 'full stock' || lower === 'all stock' || lower === 'पूरा स्टॉक') {
+      const items = await db.stockItems.toArray();
+      if (items.length === 0) {
+        return { timestamp, reply: '📦 Inventory is currently empty.' };
+      }
 
-    // 2. Help / नमस्ते
-    if (
-      text === 'help' ||
-      text === 'मदद' ||
-      text === 'hi' ||
-      text === 'hello' ||
-      text === 'नमस्ते'
-    ) {
-      const helpMsg =
-        `🤖 *Smart POS WhatsApp Assistant*\n\n` +
-        `You can ask me questions in English or हिंदी:\n\n` +
-        `📦 *Stock Queries:*\n` +
-        `• "full stock" or "पूरा स्टॉक"\n` +
-        `• "item <name/id>" or "सामान <नाम/आईडी>"\n\n` +
-        `📜 *Customer History:*\n` +
-        `• "orders <phone/name>" or "ऑर्डर <फोन/नाम>"\n\n` +
-        `🔄 *Sync Status:*\n` +
-        `• "sync status" or "सिंक"`;
-      return { reply: helpMsg, success: true, timestamp, authorized: !!senderRole };
-    }
+      const lines = items.map((it, idx) => {
+        const lowBadge = it.quantityLeft <= it.threshold ? ' ⚠️[LOW]' : '';
+        const baseLine = [
+          `${idx + 1}. *${it.name}* (${it.id})${lowBadge}`,
+          `   📍 Shelf: ${it.shelfLocation} | Qty: *${formatQuantity(it.quantityLeft, it.unitType)}* | Price: ${formatCurrency(it.sellingPrice, currency)}${canViewCost ? ` | Avg Cost: ${formatCurrency(it.averagePurchasePrice, currency)}` : ''}`,
+        ].join('\n');
 
-    // 3. Last Sync Status
-    if (
-      text.includes('sync') ||
-      text.includes('सिंक') ||
-      text.includes('last update')
-    ) {
-      const syncMeta = await getDb().syncMeta.get('cloud_sync');
-      const lastSync = syncMeta?.lastSyncedAt
-        ? new Date(syncMeta.lastSyncedAt).toLocaleString('en-IN')
-        : 'Never';
+        if (it.hasVariants && it.variants && it.variants.length > 0) {
+          const vLines = it.variants
+            .map(
+              (v) =>
+                `   ↳ [${v.barcode || v.id}] ${v.color || ''} ${v.size || ''}: *${v.quantityLeft}* left @ ${formatCurrency(v.sellingPrice, currency)} (Shelf: ${v.shelfLocation || it.shelfLocation})`
+            )
+            .join('\n');
+          return `${baseLine}\n${vLines}`;
+        }
+        return baseLine;
+      });
+
       return {
-        reply:
-          `🔄 *POS Cloud Sync Status*\n` +
-          `• Last Sync: *${lastSync}*\n` +
-          `• State: *${syncMeta?.status || 'idle'}*\n` +
-          `• Offline mode: Active in local browser IndexedDB`,
-        success: true,
         timestamp,
-        authorized: !!senderRole,
+        reply: [
+          `📦 *${bizName} — Full Stock (${items.length} items)*`,
+          `────────────────────`,
+          lines.join('\n\n'),
+        ].join('\n'),
       };
     }
 
-    // 4. Full Stock List
+    // 3. LOW STOCK ALERT / SUPPLIER PO LIST
     if (
-      text === 'stock' ||
-      text === 'full stock' ||
-      text === 'all stock' ||
-      text === 'पूरा स्टॉक' ||
-      text === 'सारा स्टॉक' ||
-      text === 'स्टॉक'
+      lower === 'low' ||
+      lower === 'low stock' ||
+      lower === 'restock' ||
+      lower === 'कम स्टॉक'
     ) {
-      const items = await getDb().stockItems.toArray();
-      if (items.length === 0) {
+      const items = await db.stockItems.toArray();
+      const lowBlocks: string[] = [];
+
+      items.forEach((it) => {
+        const lowVariants =
+          it.hasVariants && it.variants
+            ? it.variants.filter((v) => v.quantityLeft <= v.threshold)
+            : [];
+        const isMainLow = it.quantityLeft <= it.threshold;
+
+        if (!isMainLow && lowVariants.length === 0) return;
+
+        const latestSupplier =
+          it.purchaseHistory && it.purchaseHistory.length > 0
+            ? it.purchaseHistory[0].supplier || 'General Supplier'
+            : 'General Supplier';
+
+        if (it.hasVariants && lowVariants.length > 0) {
+          const vDetails = lowVariants
+            .map(
+              (v) =>
+                `   • ${v.color || ''} ${v.size || ''} (Serial: ${v.barcode || 'N/A'}) — *${v.quantityLeft}* left (Alert ≤ ${v.threshold}) | Shelf: ${v.shelfLocation || it.shelfLocation}`
+            )
+            .join('\n');
+          lowBlocks.push(
+            `⚠️ *${it.name}* (${it.id}) — Supplier: _${latestSupplier}_\n${vDetails}`
+          );
+        } else {
+          lowBlocks.push(
+            `⚠️ *${it.name}* (${it.id}) — *${formatQuantity(it.quantityLeft, it.unitType)}* left (Alert ≤ ${it.threshold})\n   📍 Shelf: ${it.shelfLocation} | Supplier: _${latestSupplier}_`
+          );
+        }
+      });
+
+      if (lowBlocks.length === 0) {
         return {
-          reply: `📦 Inventory is currently empty. / स्टॉक खाली है।`,
-          success: true,
           timestamp,
-          authorized: !!senderRole,
+          reply: '✅ All items and variants are well-stocked above their alert thresholds!',
         };
       }
 
-      let reply = `📦 *Current Stock Summary (${items.length} items)*\n`;
-      reply += `_As of ${timestamp}_\n\n`;
-
-      items.forEach((item: StockItem, index: number) => {
-        const isLow = item.quantityLeft <= item.threshold;
-        const alertIcon = isLow ? '⚠️ [LOW] ' : '✅ ';
-        reply += `${index + 1}. ${alertIcon}*${item.name}* (${item.id})\n`;
-        reply += `   • Shelf: ${item.shelfLocation}\n`;
-        reply += `   • Qty: *${formatQuantity(item.quantityLeft, item.unitType)}*\n`;
-        reply += `   • Sell Price: ${formatCurrency(item.sellingPrice)}\n`;
-        if (senderRole === 'admin') {
-          reply += `   • Avg Cost: ${formatCurrency(item.averagePurchasePrice)}\n`;
-        }
-        reply += `\n`;
-      });
-
-      return { reply, success: true, timestamp, authorized: !!senderRole };
+      return {
+        timestamp,
+        reply: [
+          `🚨 *${bizName} — Low Stock / Restock Order List (${lowBlocks.length})*`,
+          `────────────────────`,
+          lowBlocks.join('\n\n'),
+        ].join('\n'),
+      };
     }
 
-    // 5. Specific Item Stock Query (e.g. "item shirt" or "सामान 101" or "rice")
-    const itemMatch =
-      text.startsWith('item ') ||
-      text.startsWith('सामान ') ||
-      text.startsWith('stock ') ||
-      text.startsWith('चेक ');
+    // 4. PENDING DUES / UDHAAR LIST
+    if (
+      lower === 'dues' ||
+      lower === 'due' ||
+      lower === 'udhaar' ||
+      lower === 'pending' ||
+      lower === 'उधार'
+    ) {
+      const receipts = await db.receipts.toArray();
+      const dueReceipts = receipts
+        .filter((r) => r.status !== 'cancelled' && r.balanceDue > 0)
+        .sort((a, b) => b.balanceDue - a.balanceDue);
 
-    if (itemMatch || text.includes('कितना') || text.includes('how much')) {
-      const cleanTerm = text
-        .replace(/^(item|सामान|stock|चेक|कितना|how much)\s*/i, '')
-        .trim();
-
-      const items = await getDb().stockItems
-        .filter(
-          (i: StockItem) =>
-            i.id.toLowerCase().includes(cleanTerm) ||
-            i.name.toLowerCase().includes(cleanTerm) ||
-            !!(
-              i.hindiName && i.hindiName.toLowerCase().includes(cleanTerm)
-            ) ||
-            !!(i.serialNumber && i.serialNumber.toLowerCase().includes(cleanTerm))
-        )
-        .toArray();
-
-      if (items.length === 0) {
+      if (dueReceipts.length === 0) {
         return {
-          reply: `🔍 No item found matching "*${cleanTerm}*".\nकोई सामान नहीं मिला।`,
-          success: false,
           timestamp,
-          authorized: !!senderRole,
+          reply: '🎉 Zero pending dues! All customer bills are settled.',
         };
       }
 
-      let reply = `🔍 *Found ${items.length} matching item(s):*\n\n`;
-      items.forEach((item: StockItem) => {
-        const isLow = item.quantityLeft <= item.threshold;
-        reply += `📌 *${item.name}* (${item.id})\n`;
-        if (item.hindiName) reply += `   (हिंदी: ${item.hindiName})\n`;
-        reply += `   • Shelf: *${item.shelfLocation}*\n`;
-        reply += `   • Available: *${formatQuantity(item.quantityLeft, item.unitType)}* ${
-          isLow ? '⚠️ *(कम स्टॉक - Low Stock!)*' : ''
-        }\n`;
-        reply += `   • Selling Price: *${formatCurrency(item.sellingPrice)}*\n`;
-        if (senderRole === 'admin') {
-          reply += `   • Avg Purchase Cost: *${formatCurrency(item.averagePurchasePrice)}*\n`;
-        }
-
-        if (item.hasVariants && item.variants && item.variants.length > 0) {
-          reply += `   • Variants Breakdown:\n`;
-          item.variants.forEach((v: any) => {
-            reply += `     - [${v.color || ''} ${v.size || ''}]: ${v.quantityLeft} left @ ${formatCurrency(v.sellingPrice)}\n`;
-          });
-        }
-        reply += `\n`;
+      const totalDue = dueReceipts.reduce((s, r) => s + r.balanceDue, 0);
+      const lines = dueReceipts.map((r, i) => {
+        const dStr = new Date(r.createdAt).toLocaleDateString('en-IN', {
+          day: '2-digit',
+          month: 'short',
+        });
+        return [
+          `${i + 1}. *${r.customerName}* ${r.customerPhone ? `(${r.customerPhone})` : ''}`,
+          `   🧾 ${r.id} (${dStr}) | Total: ${formatCurrency(r.grandTotal, currency)} | Paid: ${formatCurrency(r.amountReceived, currency)}`,
+          `   🔴 *Balance Due: ${formatCurrency(r.balanceDue, currency)}*`,
+        ].join('\n');
       });
 
-      return { reply, success: true, timestamp, authorized: !!senderRole };
+      return {
+        timestamp,
+        reply: [
+          `🧾 *${bizName} — Pending Customer Dues (${dueReceipts.length})*`,
+          `💰 *Total Collectible: ${formatCurrency(totalDue, currency)}*`,
+          `────────────────────`,
+          lines.join('\n\n'),
+        ].join('\n'),
+      };
     }
 
-    // 6. Customer Order History (e.g. "orders 9876543210" or "ऑर्डर राहुल")
-    const orderMatch =
-      text.startsWith('order ') ||
-      text.startsWith('orders ') ||
-      text.startsWith('ऑर्डर ') ||
-      text.startsWith('history ') ||
-      text.startsWith('इतिहास ');
+    // 5. TODAY'S SUMMARY / DAILY CLOSING REPORT
+    if (
+      lower === 'today' ||
+      lower === 'summary' ||
+      lower === 'daily report' ||
+      lower === 'आज का हिसाब'
+    ) {
+      const receipts = await db.receipts.toArray();
+      const todayKey = new Date().toISOString().slice(0, 10);
 
-    if (orderMatch) {
-      const cleanCustomer = text
-        .replace(/^(order|orders|ऑर्डर|history|इतिहास|customer)\s*/i, '')
-        .trim();
+      const activeReceipts = receipts.filter((r) => r.status !== 'cancelled');
+      const createdToday = activeReceipts.filter(
+        (r) => (r.createdAt || '').slice(0, 10) === todayKey
+      );
 
-      const allReceipts = await getDb().receipts.toArray();
-      const matched = allReceipts
-        .filter(
-          (r: any) =>
-            (r.customerPhone && r.customerPhone.includes(cleanCustomer)) ||
-            (r.customerName && r.customerName.toLowerCase().includes(cleanCustomer))
-        )
-        .sort((a: any, b: any) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+      let todaySalesTotal = 0;
+      createdToday.forEach((r) => {
+        todaySalesTotal += r.grandTotal;
+      });
+
+      const methodTotals: Record<string, number> = {};
+      let todayCollectedTotal = 0;
+
+      activeReceipts.forEach((r) => {
+        (r.payments || []).forEach((p) => {
+          if ((p.date || '').slice(0, 10) === todayKey) {
+            todayCollectedTotal += p.amount;
+            const m = formatPaymentMethod(p.method);
+            methodTotals[m] = (methodTotals[m] || 0) + p.amount;
+          }
+        });
+      });
+
+      const modeBreakdown =
+        Object.keys(methodTotals).length > 0
+          ? Object.entries(methodTotals)
+              .map(([m, amt]) => `   • ${m}: *${formatCurrency(amt, currency)}*`)
+              .join('\n')
+          : '   • _No payments logged today_';
+
+      const overallPendingDue = activeReceipts.reduce((s, r) => s + r.balanceDue, 0);
+
+      return {
+        timestamp,
+        reply: [
+          `📊 *${bizName} — Daily Summary (${new Date().toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' })})*`,
+          `────────────────────`,
+          `🛍️ *New Orders Today:* ${createdToday.length}`,
+          `📈 *Today's Billed Sales:* ${formatCurrency(todaySalesTotal, currency)}`,
+          `💵 *Today's Collections:* ${formatCurrency(todayCollectedTotal, currency)}`,
+          modeBreakdown,
+          `────────────────────`,
+          `🔴 *Total Store Balance Due:* ${formatCurrency(overallPendingDue, currency)}`,
+        ].join('\n'),
+      };
+    }
+
+    // 6. QUICK PAYMENT COMMAND: "pay REC-2026-0001 5000 upi [ref]"
+    if (lower.startsWith('pay ')) {
+      if (!canEditReceipt) {
+        return {
+          timestamp,
+          reply: '⛔ Your role does not have permission to record payments.',
+        };
+      }
+
+      const parts = msg.split(/\s+/);
+      if (parts.length < 3) {
+        return {
+          timestamp,
+          reply:
+            '⚠️ Usage: *pay <Receipt-ID> <Amount> [cash|upi|card|bank_transfer|check] [Ref]*\nExample: `pay REC-2026-0001 5000 upi`',
+        };
+      }
+
+      const recIdInput = parts[1].toUpperCase();
+      const amount = parseFloat(parts[2]);
+      const rawMethod = (parts[3] || 'cash').toLowerCase();
+      const refNote = parts.slice(4).join(' ').trim();
+
+      if (isNaN(amount) || amount <= 0) {
+        return { timestamp, reply: '⚠️ Please enter a valid positive payment amount.' };
+      }
+
+      const validMethods: PaymentEntry['method'][] = [
+        'cash',
+        'upi',
+        'card',
+        'bank_transfer',
+        'credit',
+        'check',
+      ];
+      const method: PaymentEntry['method'] = validMethods.includes(rawMethod as any)
+        ? (rawMethod as PaymentEntry['method'])
+        : 'cash';
+
+      const allReceipts = await db.receipts.toArray();
+      const target = allReceipts.find((r) => r.id.toUpperCase() === recIdInput);
+
+      if (!target) {
+        return {
+          timestamp,
+          reply: `❌ Receipt *${recIdInput}* not found.`,
+        };
+      }
+
+      const now = new Date().toISOString();
+      const newPayment: PaymentEntry = {
+        id: `pay-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        date: now,
+        amount,
+        method,
+        transactionRef: refNote || undefined,
+      };
+
+      const updatedPayments = [...(target.payments || []), newPayment];
+      const updatedReceived = updatedPayments.reduce((s, p) => s + p.amount, 0);
+      const updatedDue = Math.max(0, Number((target.grandTotal - updatedReceived).toFixed(2)));
+      const nextStatus: SalesReceipt['status'] =
+        updatedDue === 0 && target.status === 'inProgress' ? 'completed' : target.status;
+
+      await db.receipts.update(target.id, {
+        payments: updatedPayments,
+        amountReceived: updatedReceived,
+        balanceDue: updatedDue,
+        status: nextStatus,
+        updatedAt: now,
+        ...(nextStatus === 'completed' && !target.completedAt ? { completedAt: now } : {}),
+      });
+
+      scheduleCloudSync();
+
+      return {
+        timestamp,
+        actionPerformed: true,
+        reply: [
+          `✅ *Payment Recorded Successfully!*`,
+          `────────────────────`,
+          `🧾 Receipt: *${target.id}* (${target.customerName})`,
+          `💵 Deposited: *${formatCurrency(amount, currency)}* via *${formatPaymentMethod(method)}*`,
+          `💰 Total Paid: ${formatCurrency(updatedReceived, currency)} / ${formatCurrency(target.grandTotal, currency)}`,
+          `📌 Remaining Due: *${formatCurrency(updatedDue, currency)}* (${nextStatus.toUpperCase()})`,
+        ].join('\n'),
+      };
+    }
+
+    // 7. CUSTOMER ORDERS / RECEIPT LOOKUP: "orders <query>" or "bill <query>"
+    if (
+      lower.startsWith('orders ') ||
+      lower.startsWith('order ') ||
+      lower.startsWith('bill ') ||
+      lower.startsWith('receipt ')
+    ) {
+      const q = msg.replace(/^(orders?|bill|receipt)\s+/i, '').trim().toLowerCase();
+      const receipts = await db.receipts.toArray();
+      const matched = receipts.filter(
+        (r) =>
+          r.id.toLowerCase().includes(q) ||
+          r.customerName.toLowerCase().includes(q) ||
+          (r.customerPhone && r.customerPhone.toLowerCase().includes(q))
+      );
 
       if (matched.length === 0) {
         return {
-          reply: `📜 No sales orders found for customer "*${cleanCustomer}*".\nइस ग्राहक का कोई ऑर्डर नहीं मिला।`,
-          success: false,
           timestamp,
-          authorized: !!senderRole,
+          reply: `🔍 No receipts found matching *"${q}"*.`,
         };
       }
 
-      let reply = `📜 *Order History for "${cleanCustomer}" (${matched.length} orders)*\n\n`;
-      matched.slice(0, 5).forEach((rec: any, idx: number) => {
-        const orderDate = new Date(rec.createdAt).toLocaleDateString('en-IN');
-        reply += `${idx + 1}. *Receipt #${rec.id}* [${rec.status.toUpperCase()}]\n`;
-        reply += `   • Date: ${orderDate}\n`;
-        reply += `   • Customer: ${rec.customerName} (${rec.customerPhone || 'N/A'})\n`;
-        reply += `   • Total: *${formatCurrency(rec.grandTotal)}*\n`;
-        reply += `   • Paid: ${formatCurrency(rec.amountReceived)} | Due: *${formatCurrency(rec.balanceDue)}*\n`;
-        reply += `   • Items (${rec.items.length}): ${rec.items.map((i: any) => i.stockItemName).slice(0, 3).join(', ')}${
-          rec.items.length > 3 ? '...' : ''
-        }\n\n`;
+      const blocks = matched.slice(0, 5).map((r) => {
+        const grouped = groupReceiptItemsByDate(r.items, r.createdAt);
+        const dateLines = grouped
+          .map(
+            (g) =>
+              `   📅 *${g.dateLabel}:* ` +
+              g.items.map((it) => `${it.stockItemName} (x${it.quantity})`).join(', ')
+          )
+          .join('\n');
+
+        const paymentLines =
+          r.payments && r.payments.length > 0
+            ? r.payments
+                .map(
+                  (p) =>
+                    `   💳 ${new Date(p.date).toLocaleDateString('en-IN', { day: '2-digit', month: 'short' })}: ${formatCurrency(p.amount, currency)} (${formatPaymentMethod(p.method)})`
+                )
+                .join('\n')
+            : '   💳 _No deposits recorded_';
+
+        return [
+          `🧾 *${r.id}* — *${r.customerName}* ${r.customerPhone ? `(${r.customerPhone})` : ''}`,
+          `   📌 Status: ${r.status.toUpperCase()}`,
+          dateLines,
+          paymentLines,
+          `   💰 Total: *${formatCurrency(r.grandTotal, currency)}* | Paid: ${formatCurrency(r.amountReceived, currency)} | *Due: ${formatCurrency(r.balanceDue, currency)}*`,
+        ].join('\n');
       });
 
-      return { reply, success: true, timestamp, authorized: !!senderRole };
+      return {
+        timestamp,
+        reply: [
+          `📋 *Matched Receipts (${matched.length})*`,
+          `────────────────────`,
+          blocks.join('\n\n'),
+        ].join('\n'),
+      };
     }
 
-    // Fallback unrecognized command
+    // 8. STOCK / VARIANT / SHELF SEARCH ("stock <q>", "shelf <q>", "सामान <q>", or direct query)
+    const cleanQuery = msg
+      .replace(/^(stock|item|search|shelf|सामान|स्टॉक)\s+/i, '')
+      .trim()
+      .toLowerCase();
+
+    const allItems = await db.stockItems.toArray();
+    const matchedItems = allItems.filter((item) => {
+      const mainMatch =
+        item.id.toLowerCase().includes(cleanQuery) ||
+        item.name.toLowerCase().includes(cleanQuery) ||
+        (item.hindiName && item.hindiName.toLowerCase().includes(cleanQuery)) ||
+        (item.serialNumber && item.serialNumber.toLowerCase().includes(cleanQuery)) ||
+        item.shelfLocation.toLowerCase().includes(cleanQuery) ||
+        (item.category && item.category.toLowerCase().includes(cleanQuery));
+
+      const variantMatch =
+        item.hasVariants && item.variants
+          ? item.variants.some(
+              (v) =>
+                v.id.toLowerCase().includes(cleanQuery) ||
+                (v.color && v.color.toLowerCase().includes(cleanQuery)) ||
+                (v.size && v.size.toLowerCase().includes(cleanQuery)) ||
+                (v.barcode && v.barcode.toLowerCase().includes(cleanQuery)) ||
+                (v.shelfLocation && v.shelfLocation.toLowerCase().includes(cleanQuery))
+            )
+          : false;
+
+      return mainMatch || variantMatch;
+    });
+
+    if (matchedItems.length > 0) {
+      const results = matchedItems.slice(0, 8).map((it) => {
+        const head = [
+          `📦 *${it.name}* ${it.hindiName ? `(${it.hindiName})` : ''}`,
+          `   🆔 SKU: ${it.id} | Serial: ${it.serialNumber || '—'} | 📍 Base Shelf: *${it.shelfLocation}*`,
+          `   📊 Total Stock: *${formatQuantity(it.quantityLeft, it.unitType)}* | Base Price: *${formatCurrency(it.sellingPrice, currency)}*${canViewCost ? ` | Avg Cost: ${formatCurrency(it.averagePurchasePrice, currency)}` : ''}`,
+        ].join('\n');
+
+        if (it.hasVariants && it.variants && it.variants.length > 0) {
+          const vRows = it.variants
+            .map((v) => {
+              const vLow = v.quantityLeft <= v.threshold ? ' ⚠️[LOW]' : '';
+              return [
+                `   ↳ *${v.color || ''} ${v.size || ''}* [Serial: ${v.barcode || 'N/A'}]`,
+                `      Qty: *${v.quantityLeft}*${vLow} | Price: *${formatCurrency(v.sellingPrice, currency)}*${canViewCost ? ` | Cost: ${formatCurrency(v.purchasePrice, currency)}` : ''} | 📍 Shelf: *${v.shelfLocation || it.shelfLocation}*`,
+              ].join('\n');
+            })
+            .join('\n');
+          return `${head}\n${vRows}`;
+        }
+        return head;
+      });
+
+      return {
+        timestamp,
+        reply: [
+          `🔎 *Stock & Variant Matches (${matchedItems.length})*`,
+          `────────────────────`,
+          results.join('\n\n'),
+        ].join('\n'),
+      };
+    }
+
     return {
-      reply:
-        `❓ Command not recognized: "${messageText}"\n\n` +
-        `Send *help* or *मदद* to see supported commands like:\n` +
-        `• "full stock" / "पूरा स्टॉक"\n` +
-        `• "item <name>" / "सामान <नाम>"\n` +
-        `• "orders <phone>" / "ऑर्डर <फोन नंबर>"`,
-      success: false,
       timestamp,
-      authorized: !!senderRole,
+      reply: [
+        `🤔 No stock item, variant serial, or command found for *"${msg}"*.`,
+        `Type *"help"* or click one of the quick chips below to view available commands.`,
+      ].join('\n'),
     };
   },
 };
