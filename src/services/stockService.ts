@@ -2,6 +2,57 @@ import { useAppStore, scheduleCloudSync } from '../store/useAppStore';
 import type { StockItem, ReceiptItem, PurchaseHistoryEntry } from '../types';
 import { calculateWeightedAveragePrice } from '../utils/pricing';
 
+const DELETED_IDS_KEY_PREFIX = 'smartpos_deleted_ids_';
+
+export interface DeletedRegistry {
+  stockItems: string[];
+  categories: string[];
+  receipts: string[];
+}
+
+export const getDeletedRegistry = (businessId: string): DeletedRegistry => {
+  try {
+    const raw = localStorage.getItem(`${DELETED_IDS_KEY_PREFIX}${businessId}`);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      return {
+        stockItems: Array.isArray(parsed.stockItems) ? parsed.stockItems : [],
+        categories: Array.isArray(parsed.categories) ? parsed.categories : [],
+        receipts: Array.isArray(parsed.receipts) ? parsed.receipts : [],
+      };
+    }
+  } catch {
+    // fallback
+  }
+  return { stockItems: [], categories: [], receipts: [] };
+};
+
+export const markEntityDeleted = (
+  entity: keyof DeletedRegistry,
+  id: string
+): void => {
+  const bizId = useAppStore.getState().activeBusiness?.id;
+  if (!bizId) return;
+  const reg = getDeletedRegistry(bizId);
+  if (!reg[entity].includes(id)) {
+    reg[entity].push(id);
+    localStorage.setItem(`${DELETED_IDS_KEY_PREFIX}${bizId}`, JSON.stringify(reg));
+  }
+};
+
+export const unmarkEntityDeleted = (
+  entity: keyof DeletedRegistry,
+  id: string
+): void => {
+  const bizId = useAppStore.getState().activeBusiness?.id;
+  if (!bizId) return;
+  const reg = getDeletedRegistry(bizId);
+  if (reg[entity].includes(id)) {
+    reg[entity] = reg[entity].filter((existingId) => existingId !== id);
+    localStorage.setItem(`${DELETED_IDS_KEY_PREFIX}${bizId}`, JSON.stringify(reg));
+  }
+};
+
 const getDb = () => {
   const db = useAppStore.getState().currentDb;
   if (!db) throw new Error('Database not initialized. Please login.');
@@ -71,6 +122,8 @@ export const StockService = {
     if (existing) {
       throw new Error(`Item ID "${item.id}" already exists.`);
     }
+
+    unmarkEntityDeleted('stockItems', item.id);
 
     const now = new Date().toISOString();
     const finalItem: StockItem = {
@@ -176,12 +229,13 @@ export const StockService = {
   },
 
   /**
-   * Delete a stock item by ID (Admin/Manager only - checked in UI)
+   * Delete a stock item by ID and push deletion to cloud immediately
    */
   async deleteItem(itemId: string): Promise<void> {
     const db = getDb();
+    markEntityDeleted('stockItems', itemId);
     await db.stockItems.delete(itemId);
-    scheduleCloudSync();
+    void useAppStore.getState().syncWithCloud();
   },
 
   /**
@@ -218,13 +272,14 @@ export const StockService = {
 
     const id = `cat-${Date.now()}`;
     const now = new Date().toISOString();
+    unmarkEntityDeleted('categories', id);
     await db.categories.add({ id, name: trimmed, createdAt: now, updatedAt: now });
     scheduleCloudSync();
     return id;
   },
 
   /**
-   *Update an existing category's display name
+   * Update an existing category's display name
    */
   async updateCategory(id: string, name: string): Promise<void> {
     const db = getDb();
@@ -244,10 +299,11 @@ export const StockService = {
   },
 
   /**
-   * Delete a category by ID and unassign it from any items using it
+   * Delete a category by ID, unassign it from items, and push deletion to cloud immediately
    */
   async deleteCategory(id: string): Promise<void> {
     const db = getDb();
+    markEntityDeleted('categories', id);
     await db.transaction('rw', db.categories, db.stockItems, async () => {
       await db.categories.delete(id);
       const affectedItems = await db.stockItems.filter((item) => item.category === id).toArray();
@@ -259,6 +315,6 @@ export const StockService = {
         });
       }
     });
-    scheduleCloudSync();
+    void useAppStore.getState().syncWithCloud();
   },
 };

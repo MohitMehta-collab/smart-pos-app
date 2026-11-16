@@ -2,7 +2,8 @@ import React, { useState, useEffect, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { SalesReceipt, ReceiptItem, PaymentEntry } from '../../types';
 import { formatCurrency } from '../../utils/pricing';
-import { useAppStore, scheduleCloudSync } from '../../store/useAppStore';
+import { useAppStore } from '../../store/useAppStore';
+import { markEntityDeleted } from '../../services/stockService';
 import {
   Search,
   Calendar,
@@ -245,10 +246,11 @@ export const OrderHistory: React.FC<OrderHistoryProps> = ({ onViewReceipt }) => 
     if (!currentDb) return;
     if (!window.confirm(`Delete receipt ${receipt.id}? This cannot be undone.`)) return;
     try {
+      markEntityDeleted('receipts', receipt.id);
       await currentDb.receipts.delete(receipt.id);
       if (selectedReceipt?.id === receipt.id) setSelectedReceipt(null);
       await loadReceipts();
-      scheduleCloudSync();
+      void useAppStore.getState().syncWithCloud();
     } catch (err) {
       console.error('Failed to delete receipt', err);
       alert('Failed to delete receipt.');

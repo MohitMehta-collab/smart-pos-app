@@ -9,7 +9,13 @@ import type {
   RoleDefinition,
   Category,
 } from '../types';
-import { isSupabaseConfigured, sbSelect, sbUpsert } from './supabaseClient';
+import {
+  isSupabaseConfigured,
+  getSupabaseConfig,
+  sbSelect,
+  sbUpsert,
+} from './supabaseClient';
+import { getDeletedRegistry } from './stockService';
 
 export interface SyncResult {
   ok: boolean;
@@ -19,12 +25,50 @@ export interface SyncResult {
   message: string;
 }
 
+const DEFAULT_DEMO_STOCK_IDS = ['ITEM-101', 'ITEM-102', 'ITEM-103'];
+const DEFAULT_DEMO_CATEGORY_IDS = [
+  'cat-clothing',
+  'cat-grocery',
+  'cat-electronics',
+  'cat-hardware',
+  'cat-pharmacy',
+  'cat-other',
+];
+
+async function deleteRemoteRowsByIds(
+  table: string,
+  businessId: string,
+  ids: string[]
+): Promise<void> {
+  if (!ids.length) return;
+  const cfg = getSupabaseConfig();
+  if (!cfg?.url || !cfg?.anonKey) return;
+
+  const cleanUrl = cfg.url.replace(/\/+$/, '');
+  const encodedIds = ids.map((id) => `"${id.replace(/"/g, '')}"`).join(',');
+  const endpoint = `${cleanUrl}/rest/v1/${table}?business_id=eq.${encodeURIComponent(
+    businessId
+  )}&id=in.(${encodeURIComponent(encodedIds)})`;
+
+  try {
+    await fetch(endpoint, {
+      method: 'DELETE',
+      headers: {
+        apikey: cfg.anonKey,
+        Authorization: `Bearer ${cfg.anonKey}`,
+        'Content-Type': 'application/json',
+      },
+    });
+  } catch (err) {
+    console.error(`Failed to delete remote rows from ${table}:`, err);
+  }
+}
+
 export class CloudSyncService {
   private static isSyncing = false;
 
   /**
    * Pull all registered businesses from Supabase into local registryDb
-   * (Allows logging into your business on a brand-new laptop/tablet/phone!)
    */
   static async pullBusinessesFromCloud(): Promise<Business[]> {
     if (!isSupabaseConfigured() || !navigator.onLine) {
@@ -36,6 +80,8 @@ export class CloudSyncService {
         is_active: 'eq.true',
         order: 'created_at.asc',
       });
+
+      const remoteIds = new Set(remoteRows.map((r: any) => r.id));
 
       for (const row of remoteRows) {
         const mapped: Business = {
@@ -51,6 +97,16 @@ export class CloudSyncService {
           isActive: row.is_active !== false,
         };
         await registryDb.businesses.put(mapped);
+      }
+
+      // Remove any local businesses that are no longer in Supabase (e.g. deleted test workspaces)
+      const localBusinesses = await registryDb.businesses.toArray();
+      const staleIds = localBusinesses
+        .filter((b) => !remoteIds.has(b.id))
+        .map((b) => b.id);
+
+      if (staleIds.length > 0) {
+        await registryDb.businesses.bulkDelete(staleIds);
       }
     } catch (err) {
       console.error('Failed to pull businesses from Supabase:', err);
@@ -85,8 +141,10 @@ export class CloudSyncService {
   }
 
   /**
-   * Full Two-Way Sync for a Business (Push local -> Cloud, then Pull Cloud -> Local)
-   * Uses `updatedAt` timestamp comparison so newer edits always win.
+   * Full Two-Way Sync for a Business:
+   * 1. Propagates local deletions (tombstones + legacy demo seed IDs) to Supabase
+   * 2. Pushes local -> Cloud
+   * 3. Pulls Cloud -> Local (ignoring any deleted IDs so deleted items NEVER reappear!)
    */
   static async syncBusiness(biz: Business, db: POSDatabase): Promise<SyncResult> {
     const nowIso = new Date().toISOString();
@@ -127,6 +185,11 @@ export class CloudSyncService {
     let pulled = 0;
 
     try {
+      const prevSyncMeta = await db.syncMeta.get('cloud_sync');
+      const lastSyncedMs = prevSyncMeta?.lastSyncedAt
+        ? new Date(prevSyncMeta.lastSyncedAt).getTime()
+        : 0;
+
       await db.syncMeta.put({
         id: 'cloud_sync',
         key: 'cloud_sync',
@@ -138,7 +201,7 @@ export class CloudSyncService {
       // 1. Ensure Business row exists in Supabase
       await this.pushBusiness(biz);
 
-      // 2. Read local tables
+      // 2. Read local tables & deleted IDs registry
       const [localRoles, localUsers, localCats, localStock, localReceipts, localCustomers] =
         await Promise.all([
           db.roles.toArray(),
@@ -148,6 +211,28 @@ export class CloudSyncService {
           db.receipts.toArray(),
           db.customers.toArray(),
         ]);
+
+      const deletedReg = getDeletedRegistry(biz.id);
+      const localStockIds = new Set(localStock.map((s) => s.id));
+      const localCatIds = new Set(localCats.map((c) => c.id));
+
+      // Combine explicit tombstones + any legacy demo seed IDs that were deleted locally
+      const deletedStockIds = new Set<string>([
+        ...deletedReg.stockItems,
+        ...DEFAULT_DEMO_STOCK_IDS.filter((id) => !localStockIds.has(id)),
+      ]);
+      const deletedCatIds = new Set<string>([
+        ...deletedReg.categories,
+        ...DEFAULT_DEMO_CATEGORY_IDS.filter((id) => !localCatIds.has(id)),
+      ]);
+      const deletedReceiptIds = new Set<string>(deletedReg.receipts);
+
+      // Push deletions to Supabase first so cloud stays clean
+      await Promise.all([
+        deleteRemoteRowsByIds('stock_items', biz.id, Array.from(deletedStockIds)),
+        deleteRemoteRowsByIds('categories', biz.id, Array.from(deletedCatIds)),
+        deleteRemoteRowsByIds('receipts', biz.id, Array.from(deletedReceiptIds)),
+      ]);
 
       // 3. Push local records to Supabase (Upsert)
       if (localRoles.length > 0) {
@@ -168,10 +253,27 @@ export class CloudSyncService {
         pushed += localRoles.length;
       }
 
-      if (localUsers.length > 0) {
+      // Pull remote users first so manual password/PIN edits made in Supabase Dashboard are never overwritten by stale local users
+      const preRemoteUsers = await sbSelect<any>('app_users', { business_id: `eq.${biz.id}` });
+      for (const ru of preRemoteUsers) {
+        await db.users.put({
+          id: ru.id,
+          username: ru.username,
+          fullName: ru.full_name,
+          phone: ru.phone || undefined,
+          email: ru.email || undefined,
+          role: ru.role,
+          pinCode: ru.pin_code || undefined,
+          password: ru.password || undefined,
+          isActive: ru.is_active !== false,
+          createdAt: ru.created_at,
+        });
+      }
+      const mergedLocalUsers = await db.users.toArray();
+      if (mergedLocalUsers.length > 0) {
         await sbUpsert(
           'app_users',
-          localUsers.map((u) => ({
+          mergedLocalUsers.map((u) => ({
             id: u.id,
             business_id: biz.id,
             username: u.username,
@@ -190,10 +292,28 @@ export class CloudSyncService {
         pushed += localUsers.length;
       }
 
-      if (localCats.length > 0) {
+      const bizFilter = { business_id: `eq.${biz.id}` };
+      const [remoteRoles, remoteUsers, remoteCats, remoteStock, remoteReceipts, remoteCustomers] =
+        await Promise.all([
+          sbSelect<any>('roles', bizFilter),
+          sbSelect<any>('app_users', bizFilter),
+          sbSelect<any>('categories', bizFilter),
+          sbSelect<any>('stock_items', bizFilter),
+          sbSelect<any>('receipts', bizFilter),
+          sbSelect<any>('customers', bizFilter),
+        ]);
+
+      const remoteCatIds = new Set(remoteCats.map((r: any) => r.id));
+      const remoteStockIds = new Set(remoteStock.map((r: any) => r.id));
+      const remoteReceiptIds = new Set(remoteReceipts.map((r: any) => r.id));
+
+      const catsToPush = localCats.filter(
+        (c) => !remoteCatIds.has(c.id) || new Date(c.updatedAt).getTime() > lastSyncedMs
+      );
+      if (catsToPush.length > 0) {
         await sbUpsert(
           'categories',
-          localCats.map((c) => ({
+          catsToPush.map((c) => ({
             id: c.id,
             business_id: biz.id,
             name: c.name,
@@ -202,13 +322,16 @@ export class CloudSyncService {
           })),
           'business_id,id'
         );
-        pushed += localCats.length;
+        pushed += catsToPush.length;
       }
 
-      if (localStock.length > 0) {
+      const stockToPush = localStock.filter(
+        (s) => !remoteStockIds.has(s.id) || new Date(s.updatedAt).getTime() > lastSyncedMs
+      );
+      if (stockToPush.length > 0) {
         await sbUpsert(
           'stock_items',
-          localStock.map((s) => ({
+          stockToPush.map((s) => ({
             id: s.id,
             business_id: biz.id,
             serial_number: s.serialNumber || null,
@@ -229,13 +352,16 @@ export class CloudSyncService {
           })),
           'business_id,id'
         );
-        pushed += localStock.length;
+        pushed += stockToPush.length;
       }
 
-      if (localReceipts.length > 0) {
+      const receiptsToPush = localReceipts.filter(
+        (r) => !remoteReceiptIds.has(r.id) || new Date(r.updatedAt).getTime() > lastSyncedMs
+      );
+      if (receiptsToPush.length > 0) {
         await sbUpsert(
           'receipts',
-          localReceipts.map((r) => ({
+          receiptsToPush.map((r) => ({
             id: r.id,
             business_id: biz.id,
             customer_id: r.customerId || null,
@@ -258,7 +384,7 @@ export class CloudSyncService {
           })),
           'business_id,id'
         );
-        pushed += localReceipts.length;
+        pushed += receiptsToPush.length;
       }
 
       if (localCustomers.length > 0) {
@@ -280,21 +406,19 @@ export class CloudSyncService {
         pushed += localCustomers.length;
       }
 
-      // 4. Pull latest cloud records for this business & merge newer rows locally
-      const bizFilter = { business_id: `eq.${biz.id}` };
-      const [remoteRoles, remoteUsers, remoteCats, remoteStock, remoteReceipts, remoteCustomers] =
-        await Promise.all([
-          sbSelect<any>('roles', bizFilter),
-          sbSelect<any>('app_users', bizFilter),
-          sbSelect<any>('categories', bizFilter),
-          sbSelect<any>('stock_items', bizFilter),
-          sbSelect<any>('receipts', bizFilter),
-          sbSelect<any>('customers', bizFilter),
-        ]);
+      // 4. Merge latest cloud records locally (skipping deleted IDs)
+
+      const shouldAcceptRemote = (localUpdatedAt?: string, remoteUpdatedAt?: string): boolean => {
+        if (!localUpdatedAt) return true;
+        const localMs = new Date(localUpdatedAt).getTime();
+        const remoteMs = remoteUpdatedAt ? new Date(remoteUpdatedAt).getTime() : 0;
+        // Accept remote if Supabase timestamp is newer OR equal, OR if local item was not edited after the previous sync
+        return remoteMs >= localMs || localMs <= lastSyncedMs;
+      };
 
       for (const rr of remoteRoles) {
         const local = localRoles.find((l) => l.id === rr.id);
-        if (!local || new Date(rr.updated_at).getTime() > new Date(local.updatedAt).getTime()) {
+        if (!local || shouldAcceptRemote(local.updatedAt, rr.updated_at)) {
           const mapped: RoleDefinition = {
             id: rr.id,
             name: rr.name,
@@ -302,7 +426,7 @@ export class CloudSyncService {
             permissions: Array.isArray(rr.permissions) ? rr.permissions : [],
             isSystem: Boolean(rr.is_system),
             createdAt: rr.created_at,
-            updatedAt: rr.updated_at,
+            updatedAt: rr.updated_at || nowIso,
           };
           await db.roles.put(mapped);
           pulled++;
@@ -327,13 +451,14 @@ export class CloudSyncService {
       }
 
       for (const rc of remoteCats) {
+        if (deletedCatIds.has(rc.id)) continue;
         const local = localCats.find((l) => l.id === rc.id);
-        if (!local || new Date(rc.updated_at).getTime() > new Date(local.updatedAt).getTime()) {
+        if (!local || shouldAcceptRemote(local.updatedAt, rc.updated_at)) {
           const mapped: Category = {
             id: rc.id,
             name: rc.name,
             createdAt: rc.created_at,
-            updatedAt: rc.updated_at,
+            updatedAt: rc.updated_at || nowIso,
           };
           await db.categories.put(mapped);
           pulled++;
@@ -341,8 +466,9 @@ export class CloudSyncService {
       }
 
       for (const rs of remoteStock) {
+        if (deletedStockIds.has(rs.id)) continue;
         const local = localStock.find((l) => l.id === rs.id);
-        if (!local || new Date(rs.updated_at).getTime() > new Date(local.updatedAt).getTime()) {
+        if (!local || shouldAcceptRemote(local.updatedAt, rs.updated_at)) {
           const mapped: StockItem = {
             id: rs.id,
             serialNumber: rs.serial_number || undefined,
@@ -359,7 +485,7 @@ export class CloudSyncService {
             averagePurchasePrice: Number(rs.average_purchase_price) || 0,
             purchaseHistory: Array.isArray(rs.purchase_history) ? rs.purchase_history : [],
             createdAt: rs.created_at,
-            updatedAt: rs.updated_at,
+            updatedAt: rs.updated_at || nowIso,
           };
           await db.stockItems.put(mapped);
           pulled++;
@@ -367,8 +493,9 @@ export class CloudSyncService {
       }
 
       for (const rrec of remoteReceipts) {
+        if (deletedReceiptIds.has(rrec.id)) continue;
         const local = localReceipts.find((l) => l.id === rrec.id);
-        if (!local || new Date(rrec.updated_at).getTime() > new Date(local.updatedAt).getTime()) {
+        if (!local || shouldAcceptRemote(local.updatedAt, rrec.updated_at)) {
           const mapped: SalesReceipt = {
             id: rrec.id,
             customerId: rrec.customer_id || undefined,
@@ -386,7 +513,7 @@ export class CloudSyncService {
             payments: Array.isArray(rrec.payments) ? rrec.payments : [],
             notes: rrec.notes || undefined,
             createdAt: rrec.created_at,
-            updatedAt: rrec.updated_at,
+            updatedAt: rrec.updated_at || nowIso,
             completedAt: rrec.completed_at || undefined,
           };
           await db.receipts.put(mapped);

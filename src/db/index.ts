@@ -128,7 +128,8 @@ export function getPOSDatabase(businessId: string): POSDatabase {
 }
 
 /**
- * Seed default roles, users, and sample stock for a business if its database is empty.
+ * Seed default roles and users for a business if its database is empty.
+ * Never seeds dummy stock items or default categories so user deletions persist cleanly.
  */
 export async function seedBusinessDataIfNeeded(businessDb: POSDatabase) {
   const roleCount = await businessDb.roles.count();
@@ -172,124 +173,6 @@ export async function seedBusinessDataIfNeeded(businessDb: POSDatabase) {
     ]);
   }
 
-  // const stockCount = await businessDb.stockItems.count();
-  // if (stockCount === 0) {
-  //   const now = new Date().toISOString();
-  //   await businessDb.stockItems.bulkAdd([
-  //     {
-  //       id: 'ITEM-101',
-  //       serialNumber: 'SN-00101',
-  //       name: 'Cotton Casual Shirt',
-  //       hindiName: 'सूती शर्ट (कॉटन)',
-  //       category: 'cat-clothing',
-  //       shelfLocation: 'A-12',
-  //       unitType: 'count',
-  //       hasVariants: true,
-  //       quantityLeft: 18,
-  //       threshold: 10,
-  //       sellingPrice: 799,
-  //       averagePurchasePrice: 420,
-  //       purchaseHistory: [
-  //         {
-  //           id: 'ph-1',
-  //           date: new Date(Date.now() - 86400000 * 10).toISOString(),
-  //           quantity: 10,
-  //           purchasePrice: 400,
-  //           supplier: 'ABC Garments',
-  //         },
-  //         {
-  //           id: 'ph-2',
-  //           date: new Date(Date.now() - 86400000 * 2).toISOString(),
-  //           quantity: 10,
-  //           purchasePrice: 440,
-  //           supplier: 'Surat Textiles',
-  //         },
-  //       ],
-  //       variants: [
-  //         {
-  //           id: 'var-1',
-  //           color: 'Blue',
-  //           size: 'M',
-  //           quantityLeft: 8,
-  //           sellingPrice: 799,
-  //           purchasePrice: 420,
-  //           threshold: 5,
-  //         },
-  //         {
-  //           id: 'var-2',
-  //           color: 'Blue',
-  //           size: 'L',
-  //           quantityLeft: 4,
-  //           sellingPrice: 799,
-  //           purchasePrice: 420,
-  //           threshold: 5,
-  //         },
-  //         {
-  //           id: 'var-3',
-  //           color: 'White',
-  //           size: 'M',
-  //           quantityLeft: 6,
-  //           sellingPrice: 849,
-  //           purchasePrice: 420,
-  //           threshold: 4,
-  //         },
-  //       ],
-  //       createdAt: now,
-  //       updatedAt: now,
-  //     },
-  //     {
-  //       id: 'ITEM-102',
-  //       serialNumber: 'SN-00102',
-  //       name: 'Basmati Rice Premium',
-  //       hindiName: 'बासमती चावल प्रीमियम',
-  //       category: 'cat-grocery',
-  //       shelfLocation: 'G-04',
-  //       unitType: 'weight',
-  //       hasVariants: false,
-  //       quantityLeft: 4.5,
-  //       threshold: 15,
-  //       sellingPrice: 120,
-  //       averagePurchasePrice: 85,
-  //       purchaseHistory: [
-  //         {
-  //           id: 'ph-3',
-  //           date: new Date(Date.now() - 86400000 * 15).toISOString(),
-  //           quantity: 50,
-  //           purchasePrice: 85,
-  //           supplier: 'Kisan Agro Foods',
-  //         },
-  //       ],
-  //       createdAt: now,
-  //       updatedAt: now,
-  //     },
-  //     {
-  //       id: 'ITEM-103',
-  //       serialNumber: 'SN-00103',
-  //       name: 'Organic Honey 500g',
-  //       hindiName: 'जैविक शहद ५०० ग्राम',
-  //       category: 'cat-grocery',
-  //       shelfLocation: 'D-02',
-  //       unitType: 'both',
-  //       hasVariants: false,
-  //       quantityLeft: 2,
-  //       threshold: 5,
-  //       sellingPrice: 350,
-  //       averagePurchasePrice: 210,
-  //       purchaseHistory: [
-  //         {
-  //           id: 'ph-4',
-  //           date: new Date(Date.now() - 86400000 * 7).toISOString(),
-  //           quantity: 10,
-  //           purchasePrice: 210,
-  //           supplier: 'Himalayan Nectar',
-  //         },
-  //       ],
-  //       createdAt: now,
-  //       updatedAt: now,
-  //     },
-  //   ]);
-  // }
-
   const syncRow = await businessDb.syncMeta.get('cloud_sync');
   if (!syncRow) {
     await businessDb.syncMeta.put({
@@ -300,17 +183,4 @@ export async function seedBusinessDataIfNeeded(businessDb: POSDatabase) {
       status: 'idle',
     });
   }
-
-  // const categoryCount = await businessDb.categories.count();
-  // if (categoryCount === 0) {
-  //   const now = new Date().toISOString();
-  //   await businessDb.categories.bulkAdd([
-  //     { id: 'cat-clothing', name: 'Clothing', createdAt: now, updatedAt: now },
-  //     { id: 'cat-grocery', name: 'Grocery', createdAt: now, updatedAt: now },
-  //     { id: 'cat-electronics', name: 'Electronics', createdAt: now, updatedAt: now },
-  //     { id: 'cat-hardware', name: 'Hardware', createdAt: now, updatedAt: now },
-  //     { id: 'cat-pharmacy', name: 'Pharmacy', createdAt: now, updatedAt: now },
-  //     { id: 'cat-other', name: 'Other', createdAt: now, updatedAt: now },
-  //   ]);
-  // }
 }

@@ -596,7 +596,7 @@ Please keep this email secure.`;
     await dbInstance.users.add(newUser);
     const updated = await dbInstance.users.toArray();
     set({ users: updated });
-    scheduleCloudSync();
+    void get().syncWithCloud();
     return newUser;
   },
 
@@ -668,6 +668,8 @@ Please keep this email secure.`;
         ? { currentUser: updated.find((u) => u.id === userId) || current }
         : {}),
     });
+    // Immediately push updated staff credentials/PINs to cloud so other devices (mobile/desktop) can log in right away
+    void get().syncWithCloud();
   },
 
   deleteUserRole: async (userId: string) => {
